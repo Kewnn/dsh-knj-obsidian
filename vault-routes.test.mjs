@@ -94,13 +94,17 @@ test('POST /vault/switch 切换当前库，/pages 反映新库', async (t) => {
   assert.equal(pages.json.pages[0].id, 'alpha')
 })
 
-test('POST /vault/activate 按目录激活；未注册目录自动挂接', async (t) => {
+test('POST /vault/activate 按目录激活；未注册目录只登记不建库', async (t) => {
   const s = setup(t)
   const fresh = join(s.dir, 'activated')
+  mkdirSync(fresh, { recursive: true })
   const r = await req(s.handlers, '/api/obsidian-wiki/vault/activate', { method: 'POST', headers: { ...JSON_HDR, ...SAME_ORIGIN }, body: JSON.stringify({ root: fresh }) })
   assert.equal(r.status, 200)
   assert.equal(r.json.current.root, fresh)
-  assert.ok(r.json.vaults.some((v) => v.root === fresh && v.source === 'attached'))
+  // v9 新契约：自动跟随只登记与切换，不静默脚手架；initialized 如实反映磁盘
+  const entry = r.json.vaults.find((v) => v.root === fresh)
+  assert.ok(entry, '未注册目录应被登记')
+  assert.equal(entry.initialized, false, 'activate 不得静默建 .wiki')
 })
 
 test('POST /vault/attach 新建/挂接并切换；同根幂等', async (t) => {

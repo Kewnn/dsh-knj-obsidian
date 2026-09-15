@@ -58,18 +58,21 @@ test('切换库后 current() 落到目标库，页面读的是新库', (t) => {
   assert.equal(m.current().wikiRoot, join(target.root, '.wiki'))
 })
 
-test('activateRoot：已注册目录只切换；未注册目录自动挂接并脚手架 .wiki', (t) => {
+test('activateRoot：已注册目录只切换；未注册目录只注册不建库（初始化是显式动作）', (t) => {
   const s = setup(t, ['proj-a'])
   const m = makeManager(s)
   const rec = m.activateRoot(join(s.dir, 'proj-a'))
   assert.equal(rec.source, 'workspace')
   assert.equal(m.currentRecord().id, rec.id)
-  // 未注册的新目录：自动挂接（source=attached）+ .wiki 脚手架
+  // v9 新语义：未注册的新目录只登记为 workspace 并切换当前库，**不**静默建 .wiki；
+  // 建库由显式动作触发（边栏「初始化知识库」→ agent 调 wiki_init，或 attach/首次写入）。
   const fresh = join(s.dir, 'brand-new')
+  mkdirSync(fresh, { recursive: true })
   const rec2 = m.activateRoot(fresh)
-  assert.equal(rec2.source, 'attached')
-  assert.ok(existsSync(join(fresh, '.wiki', 'index.md')), '应脚手架 index.md')
+  assert.equal(rec2.source, 'workspace')
   assert.equal(m.currentRecord().id, rec2.id)
+  assert.equal(existsSync(join(fresh, '.wiki')), false, 'activate 不得静默脚手架')
+  assert.equal(m.listVaults().find((v) => v.root === fresh).initialized, false)
 })
 
 test('attachRoot：目录不存在自动创建；同根幂等返回同一 id', (t) => {

@@ -12,6 +12,23 @@ import { validateJsonSchemaValue } from '@deepseek-ai/dsh-tools'
 // 工具 body 不引用 exec；提供最小 stub 即可（ToolRunContext 契约由 registry 在真实环境注入）
 const EXEC = { deferContext() {}, concludeTurn() {} }
 
+// wiki_ingest 现在会安排一次语义索引的后台刷新（真实库冷启动约 1.5 分钟）。
+// 测试里关掉自动刷新：既避免真后台定时器，也不去碰用户真实的 ~/.dsh/qmd。
+process.env.KNJ_OBSIDIAN_AUTO_REFRESH = 'off'
+
+// 成功路径返回值里有两类与本测试关注点无关的字段：
+//   - checkpointId：动态时间戳 → 单独校验形态；
+//   - tagAudit：全库标签现状（写页后主动回报），与本源增量语义正交 → 单独校验存在性。
+// 其余「稳定字段」仍然严格比对，不用 partialDeepStrictEqual 放宽。
+const CHECKPOINT_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/
+function stableOf(res) {
+  const { checkpointId, tagAudit, ...stable } = res
+  assert.equal(typeof checkpointId, 'string', 'checkpointId 应为写前快照 id')
+  assert.match(checkpointId, CHECKPOINT_ID_RE)
+  assert.equal(typeof tagAudit, 'object', 'tagAudit 应随写页一同回报')
+  return stable
+}
+
 function makeVault() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-obsidian-tools-'))
   const store = new VaultStore(dir)
@@ -35,7 +52,7 @@ test('mountTools 注册 wiki_ingest + wiki_capture + wiki_lint + wiki_query 并�
   const fakeCtx = { tools: { register: (def) => registered.push(def) } }
   const dispose = mountTools(fakeCtx, store)
   const names = registered.map((d) => d.name)
-  assert.deepEqual(names.sort(), ['wiki_capture', 'wiki_export', 'wiki_ingest', 'wiki_lint', 'wiki_mine', 'wiki_query'])
+  assert.deepEqual(names.sort(), ['wiki_capture', 'wiki_checkpoint', 'wiki_checkpoints', 'wiki_export', 'wiki_ingest', 'wiki_init', 'wiki_lint', 'wiki_mine', 'wiki_normalize_tags', 'wiki_query', 'wiki_search_semantic'])
   assert.equal(typeof dispose, 'function')
 })
 
@@ -54,7 +71,7 @@ test('wiki_ingest 落盘页面并更新 manifest（created/updated 分流）', a
     { id: 'billing', title: 'Billing', category: 'entities', body: '账单流程。' },
   ]
   const res = await def.execute({ source, pages }, EXEC)
-  assert.deepEqual(res, { created: ['rate-limiting', 'billing'], updated: [], skipped: false })
+  assert.deepEqual(stableOf(res), { created: ['rate-limiting', 'billing'], updated: [], skipped: false, relatedCheck: [] })
 
   // 页面与 frontmatter 落盘
   const raw = readFileSync(join(dir, '.wiki', 'concepts', 'rate-limiting.md'), 'utf8')
@@ -85,7 +102,7 @@ test('wiki_ingest 重写同 id 页面：保留 created、更新 updated', async 
 
   const second = { ...first, body: '## 核心\n429 要指数退避，且要有 jitter。' }
   const res = await def.execute({ source, pages: [second] }, EXEC)
-  assert.deepEqual(res, { created: [], updated: ['rate-limiting'], skipped: false })
+  assert.deepEqual(stableOf(res), { created: [], updated: ['rate-limiting'], skipped: false, relatedCheck: [] })
 
   const back = store.readPage('rate-limiting', 'concepts')
   assert.equal(back.created, createdAt) // created 保留
@@ -117,7 +134,7 @@ test('wiki_ingest 跨源同 id 不覆盖：自动 -2 后缀新建，原页内容
   const res = await def.execute({ source: 'agent:codex', pages: [{ id: 'concept-x', title: 'X', category: 'concepts', body: 'B 源的内容' }] }, EXEC)
 
   // 新页落为 concept-x-2，原页保持 A 源内容
-  assert.deepEqual(res, { created: ['concept-x-2'], updated: [], skipped: false })
+  assert.deepEqual(stableOf(res), { created: ['concept-x-2'], updated: [], skipped: false, relatedCheck: [{ id: 'concept-x-2', title: 'X', category: 'concepts', related: [{ id: 'concept-x', title: 'X', category: 'concepts', matchedBy: 'title', linked: false, strong: true }] }] })
   const original = store.readPage('concept-x', 'concepts')
   assert.equal(original.body, 'A 源的内容', '不同来源不得静默覆盖旧源页面')
   assert.equal(original.source, 'agent:claude')
@@ -128,7 +145,7 @@ test('wiki_ingest 跨源同 id 不覆盖：自动 -2 后缀新建，原页内容
 
   // 同源重导仍是覆盖更新语义（created 保留）
   const again = await def.execute({ source: 'agent:claude', pages: [{ id: 'concept-x', title: 'X', category: 'concepts', body: 'A 源的内容 v2' }] }, EXEC)
-  assert.deepEqual(again, { created: [], updated: ['concept-x'], skipped: false })
+  assert.deepEqual(stableOf(again), { created: [], updated: ['concept-x'], skipped: false, relatedCheck: [] })
   assert.equal(store.readPage('concept-x', 'concepts').body, 'A 源的内容 v2')
 })
 
@@ -146,7 +163,7 @@ test('wiki_ingest 跨源避让后：新源重导更新自己的 -N 页（不得�
 
   // B 源再次重导同 id 更新：必须更新 concept-x-2，而不是再避让出 concept-x-3
   const res = await def.execute({ source: 'agent:codex', pages: [{ id: 'concept-x', title: 'X', category: 'concepts', body: 'B 源 v2' }] }, EXEC)
-  assert.deepEqual(res, { created: [], updated: ['concept-x-2'], skipped: false })
+  assert.deepEqual(stableOf(res), { created: [], updated: ['concept-x-2'], skipped: false, relatedCheck: [] })
   assert.equal(store.readPage('concept-x-2', 'concepts').body, 'B 源 v2', '新源重导必须更新自己的 -N 页')
   assert.equal(store.readPage('concept-x', 'concepts').body, 'A 源 v1', '原源页面仍不受影响')
   assert.equal(store.readPage('concept-x-3', 'concepts'), null, '不得无限膨胀出 concept-x-3')
@@ -189,6 +206,57 @@ test('wiki_lint 注册并返回 LintReport，输出通过 schema 校验', async 
   // 输出契约：全部属性声明且 additionalProperties:false，LintReport 结构可被 registry 校验
   const violations = validateJsonSchemaValue(def.output.schema, report)
   assert.deepEqual(violations, [])
+})
+
+test('wiki_search_semantic：无本地模型时如实返回未就绪（不联网、不假装命中、指向本地目录）', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const home = mkdtempSync(join(tmpdir(), 'dsh-semantic-home-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+
+  // 把 homedir() 指向空目录 → 模型必然缺失，分支确定
+  const savedProfile = process.env.USERPROFILE
+  const savedHome = process.env.HOME
+  process.env.USERPROFILE = home
+  process.env.HOME = home
+  t.after(() => {
+    if (savedProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = savedProfile
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome
+  })
+
+  const registered = []
+  mountTools({ tools: { register: (d) => registered.push(d) } }, { current: () => store, currentRecord: () => ({ root: dir }) })
+  const def = registered.find((d) => d.name === 'wiki_search_semantic')
+  assert.ok(def, 'wiki_search_semantic 应已注册')
+
+  const res = await def.execute({ query: '限流算法' }, EXEC)
+  assert.equal(res.status, 'model-missing', '模型缺失必须如实回报，不得静默降级成“无命中”')
+  assert.equal(res.count, 0)
+  assert.deepEqual(res.results, [])
+  assert.match(res.message, /\.dsh[\\/]qmd[\\/]models/, '应给出精确的本地模型目录')
+  assert.match(res.message, /embeddinggemma-300M-Q8_0\.gguf/)
+  assert.match(res.message, /不会自动下载/, '必须声明不会自动联网下载')
+  assert.ok(existsSync(join(home, '.dsh', 'qmd', 'models')), '应在本地创建模型目录，而不是联网获取')
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, res), [])
+})
+
+test('wiki_ingest 落盘后安排语义索引刷新（source 契约：schedule 调用存在且带来源标记）', () => {
+  const ROOT = fileURLToPath(new URL('.', import.meta.url))
+  const src = readFileSync(join(ROOT, 'src/tools.ts'), 'utf8')
+  assert.match(src, /refresherFor\(root\)\.schedule\('wiki_ingest'\)/, '入库后应安排 debounce 刷新')
+})
+
+test('打包契约：@tobilu/qmd 是 optionalDependency（内网仓库缺它时插件仍能装上并降级）', () => {
+  const ROOT = fileURLToPath(new URL('.', import.meta.url))
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  assert.equal(pkg.optionalDependencies?.['@tobilu/qmd'], '^2.8.3', '语义检索库必须是可选依赖')
+  assert.equal(pkg.dependencies?.['@tobilu/qmd'], undefined, '不得同时声明为硬依赖（内网缺库会导致整个插件装不上）')
+  for (const hard of ['dompurify', 'marked']) {
+    assert.ok(pkg.dependencies?.[hard], `${hard} 应为硬依赖`)
+  }
+  // 有它才装、没有就如实降级：库缺失分支必须仍然存在
+  const src = readFileSync(join(ROOT, 'src/semantic-index.ts'), 'utf8')
+  assert.match(src, /library-missing/, '库缺失时须保留可诊断的降级分支')
 })
 
 test('wiki_ingest/wiki_capture 工具 category 枚举含 dictionaries/tables', () => {

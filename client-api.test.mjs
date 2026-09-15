@@ -36,3 +36,30 @@ test('VaultTree/SearchBox/LintPanel 组件存在（v2 起 LintBadge 由 LintPane
     assert.ok(existsSync(join(ROOT, 'src/client', f)), `${f} 应存在`)
   }
 })
+
+// ---- v8 语义索引：客户端状态块与「更新索引」 ----
+
+test('api.ts 暴露语义索引状态与手动更新（打到 /semantic-status 与 /semantic-update）', () => {
+  const text = readFileSync(join(ROOT, 'src/client/api.ts'), 'utf8')
+  assert.match(text, /export function fetchSemanticStatus/)
+  assert.match(text, /export async function triggerSemanticUpdate/)
+  assert.match(text, /`\$\{BASE\}\/semantic-status`/)
+  assert.match(text, /`\$\{BASE\}\/semantic-update`/)
+  assert.match(text, /method: 'POST'/, '手动更新必须是同源 POST')
+})
+
+test('SemanticIndexPanel：状态块含模型/篇数/待嵌入、更新按钮、进度轮询与离线说明', () => {
+  const panel = join(ROOT, 'src/client/SemanticIndexPanel.tsx')
+  assert.ok(existsSync(panel), 'src/client/SemanticIndexPanel.tsx 应存在')
+  const text = readFileSync(panel, 'utf8')
+
+  assert.match(text, /更新索引/, '必须有手动更新入口')
+  assert.match(text, /待嵌入/, '必须显示还差多少页未嵌入')
+  assert.match(text, /模型未就位/, '模型缺失时必须如实显示，而不是假装可用')
+  assert.match(text, /不联网/, '必须说明严格离线')
+  assert.match(text, /setInterval/, '重建期间必须轮询进度（首次含模型加载，约 1–2 分钟）')
+  assert.match(text, /wiki_search_semantic/, '应指向语义检索工具')
+
+  const launcher = readFileSync(join(ROOT, 'src/client/KnowledgeDistillLauncher.tsx'), 'utf8')
+  assert.match(launcher, /SemanticIndexPanel/, '状态块必须挂载在边栏启动器上')
+})

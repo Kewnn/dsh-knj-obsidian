@@ -84,11 +84,12 @@ test('POST /rebuild-index 跨源 403 / 非 JSON 415', async (t) => {
   assert.equal(badType.status, 415)
 })
 
-test('POST /import：目录导入返回清单', async (t) => {
+test('POST /import：目录导入返回清单（源在库根内）', async (t) => {
   const { dir, store } = makeVault()
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  const src = mkdtempSync(join(tmpdir(), 'dsh-obsidian-v6src-'))
-  t.after(() => rmSync(src, { recursive: true, force: true }))
+  // v12 安全边界：只允许导入【已注册库根目录内】的 Markdown
+  const src = join(dir, 'import-src')
+  mkdirSync(src, { recursive: true })
   writeFileSync(join(src, 'note-a.md'), '# 笔记A\n\n内容A。', 'utf8')
   const { host, handlers } = makeHost()
   mountWikiRoutes(host, store)
@@ -100,6 +101,24 @@ test('POST /import：目录导入返回清单', async (t) => {
   assert.equal(r.status, 200, JSON.stringify(r.json))
   assert.equal(r.json.imported, 1)
   assert.ok(store.readPage('note-a', 'references'))
+})
+
+test('POST /import：库外路径拒绝（400，不读不写）', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const outside = mkdtempSync(join(tmpdir(), 'dsh-obsidian-outside-'))
+  t.after(() => rmSync(outside, { recursive: true, force: true }))
+  writeFileSync(join(outside, 'secret.md'), '# 库外文件\n\n不应被导入。', 'utf8')
+  const { host, handlers } = makeHost()
+  mountWikiRoutes(host, store)
+  const r = await req(handlers, '/api/obsidian-wiki/import', {
+    method: 'POST',
+    headers: { ...JSON_HDR, ...SAME_ORIGIN },
+    body: JSON.stringify({ path: outside, category: 'references' }),
+  })
+  assert.equal(r.status, 400, JSON.stringify(r.json))
+  assert.match(r.json.error, /已注册知识库根目录/)
+  assert.equal(store.readPage('secret', 'references'), null, '库外文件不得入库')
 })
 
 test('POST /import：路径缺失 400 / 不存在 4xx / 跨源 403', async (t) => {

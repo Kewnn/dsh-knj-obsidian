@@ -122,3 +122,76 @@ test('GET /lint 返回健康报告', async (t) => {
   assert.equal(result.pageCount, 2)
   assert.ok(Array.isArray(result.orphans))
 })
+
+// ---- v8 语义检索：状态 / 手动刷新（注入假刷新器，测试不碰真实 ~/.dsh/qmd） ----
+
+function fakeRefresher(overrides = {}) {
+  const state = { refreshCalls: 0, refreshing: false }
+  return {
+    state,
+    refresher: {
+      status: async () => ({
+        available: true, modelPresent: true, indexState: 'ready', documents: 7,
+        pendingEmbedding: 0, hasVectorIndex: true, refreshing: state.refreshing, ...overrides.status,
+      }),
+      refreshNow: async () => {
+        state.refreshCalls += 1
+        state.refreshing = true
+        return { ok: true, at: '2026-09-14T00:00:00.000Z', documents: 7, chunks: 9, durationMs: 1234 }
+      },
+    },
+  }
+}
+
+test('GET /semantic-status 返回语义索引状态，并按当前库根取刷新器', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { host, handlers } = makeHost()
+  const asked = []
+  const { refresher } = fakeRefresher()
+  mountWikiRoutes(host, store, { refresherFor: (root) => { asked.push(root); return refresher } })
+
+  const result = await req(handlers, '/api/obsidian-wiki/semantic-status')
+  assert.equal(result.available, true)
+  assert.equal(result.indexState, 'ready')
+  assert.equal(result.documents, 7)
+  assert.deepEqual(asked, [dir], '刷新器应按库根（.wiki 的父目录）取')
+})
+
+test('POST /semantic-update 后台启动刷新（202），不阻塞到刷新结束', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { host, handlers } = makeHost()
+  const { refresher, state } = fakeRefresher()
+  mountWikiRoutes(host, store, { refresherFor: () => refresher })
+
+  const result = await req(handlers, '/api/obsidian-wiki/semantic-update', 'POST')
+  assert.equal(result.started, true)
+  assert.equal(result.running, true, '立刻返回时就应报告「进行中」，进度由 status 轮询')
+  assert.equal(state.refreshCalls, 1)
+})
+
+test('POST /semantic-update 已在刷新时不重复排队（单飞）', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { host, handlers } = makeHost()
+  const { refresher, state } = fakeRefresher()
+  state.refreshing = true
+  mountWikiRoutes(host, store, { refresherFor: () => refresher })
+
+  const result = await req(handlers, '/api/obsidian-wiki/semantic-update', 'POST')
+  assert.equal(result.started, false)
+  assert.equal(result.running, true)
+  assert.equal(state.refreshCalls, 0, '已在刷新不得再触发一次')
+})
+
+test('GET /semantic-update 不是合法方法（405），语义状态端点只读', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const { host, handlers } = makeHost()
+  const { refresher } = fakeRefresher()
+  mountWikiRoutes(host, store, { refresherFor: () => refresher })
+
+  const result = await req(handlers, '/api/obsidian-wiki/semantic-update', 'GET')
+  assert.equal(result.error, 'method not allowed')
+})

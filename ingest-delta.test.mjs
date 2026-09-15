@@ -17,6 +17,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // 工具 body 不引用 exec；提供最小 stub 即可（ToolRunContext 契约由 registry 在真实环境注入）
 const EXEC = { deferContext() {}, concludeTurn() {} }
 
+// 成功路径返回值里有两类与本文件关注点（manifest 增量语义）无关的字段：
+//   - checkpointId：动态时间戳 → 单独校验形态；
+//   - tagAudit：全库标签现状（写页后主动回报）→ 单独校验存在性。
+// 其余稳定字段仍严格比对。
+const CHECKPOINT_ID_RE = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/
+function stableOf(res) {
+  const { checkpointId, tagAudit, ...stable } = res
+  assert.equal(typeof checkpointId, 'string', 'checkpointId 应为写前快照 id')
+  assert.match(checkpointId, CHECKPOINT_ID_RE)
+  assert.equal(typeof tagAudit, 'object', 'tagAudit 应随写页一同回报')
+  return stable
+}
+
 function makeVault() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-obsidian-delta-'))
   const store = new VaultStore(dir)
@@ -55,7 +68,7 @@ test('wiki_ingest：同 contentHash 命中 manifest → skipped:true 且不重�
 
   // 首次 ingest：传 contentHash 但无 manifest 记录 → 正常写入
   const res1 = await def.execute({ source, pages, contentHash: h }, EXEC)
-  assert.deepEqual(res1, { created: ['rate-limiting'], updated: [], skipped: false })
+  assert.deepEqual(stableOf(res1), { created: ['rate-limiting'], updated: [], skipped: false, relatedCheck: [] })
   assert.equal(store.manifestEntry(source).content_hash, h)
   const updated1 = store.readPage('rate-limiting', 'concepts').updated
   const lastIngested1 = store.manifestEntry(source).last_ingested
@@ -78,7 +91,7 @@ test('wiki_ingest：不同 contentHash 不命中 → 重写页面 skipped:false'
   const source = 'docs/input.md'
   const pages = [{ id: 'rate-limiting', title: 'Rate Limiting', category: 'concepts', body: '## 核心\n429 要指数退避。' }]
   const first = await def.execute({ source, pages }, EXEC)
-  assert.deepEqual(first, { created: ['rate-limiting'], updated: [], skipped: false })
+  assert.deepEqual(stableOf(first), { created: ['rate-limiting'], updated: [], skipped: false, relatedCheck: [] })
   const updated1 = store.readPage('rate-limiting', 'concepts').updated
 
   await sleep(5)
@@ -86,7 +99,7 @@ test('wiki_ingest：不同 contentHash 不命中 → 重写页面 skipped:false'
   // 不同 contentHash → 与 manifest 不一致 → 正常重写
   const otherHash = hash('source-v2')
   const res = await def.execute({ source, pages, contentHash: otherHash }, EXEC)
-  assert.deepEqual(res, { created: [], updated: ['rate-limiting'], skipped: false })
+  assert.deepEqual(stableOf(res), { created: [], updated: ['rate-limiting'], skipped: false, relatedCheck: [] })
   const back = store.readPage('rate-limiting', 'concepts')
   assert.notEqual(back.updated, updated1) // 页面被重写
   // manifest 被刷新为传入的 contentHash（显式提供的哈希优先于内部公式）
@@ -105,7 +118,7 @@ test('wiki_ingest：contentHash 原样入库，同 hash 二次 ingest 真正跳�
 
   // 首次 ingest：contentHash 应原样写入 manifest（而不是被内部公式覆盖）
   const res1 = await def.execute({ source, pages, contentHash: h }, EXEC)
-  assert.deepEqual(res1, { created: ['rate-limiting'], updated: [], skipped: false })
+  assert.deepEqual(stableOf(res1), { created: ['rate-limiting'], updated: [], skipped: false, relatedCheck: [] })
   assert.equal(store.manifestEntry(source).content_hash, h)
   const updated1 = store.readPage('rate-limiting', 'concepts').updated
 
@@ -125,7 +138,7 @@ test('wiki_ingest：contentHash 但无 manifest 记录 → 正常 ingest 不跳�
   const source = 'docs/new.md'
   const pages = [{ id: 'billing', title: 'Billing', category: 'entities', body: '账单流程。' }]
   const res = await def.execute({ source, pages, contentHash: hash('whatever') }, EXEC)
-  assert.deepEqual(res, { created: ['billing'], updated: [], skipped: false })
+  assert.deepEqual(stableOf(res), { created: ['billing'], updated: [], skipped: false, relatedCheck: [] })
   assert.ok(store.manifestEntry(source))
 })
 
