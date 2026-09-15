@@ -2,11 +2,12 @@
  * v6/v7 底部状态条 + 展开面板（设计 v2）：
  * - 常驻：页数 + 健康状态点（绿/琥珀/红三态）
  * - 「问题」展开：断链 / 孤儿页 / 缺 frontmatter 逐条可点跳转
- * - 「工具」展开：重建索引 / 蒸馏近期会话 / 导入 md（原顶部工具条移入，释放主视觉）
+ * - 「工具」展开：重建索引 / 导入 md（原顶部工具条移入，释放主视觉）
+ *   v10 起：会话蒸馏入口移到边栏分段「会话蒸馏」（预填/复制启动器），此处不再重复
  */
 import { useEffect, useState } from 'react'
 import { fetchLint, fetchPages, importMd, rebuildIndex, type LintReport } from './api.ts'
-import { IconChevronDown, IconImport, IconLink, IconRefresh, IconSparkles, IconWarning } from './icons.tsx'
+import { IconChevronDown, IconImport, IconLink, IconRefresh, IconWarning } from './icons.tsx'
 
 const CATEGORIES = [
   { value: 'references', label: '参考' },
@@ -17,8 +18,6 @@ const CATEGORIES = [
   { value: 'dictionaries', label: '字典' },
   { value: 'tables', label: '数据结构' },
 ]
-
-const DISTILL_TRIGGER = '用 wiki-distill 蒸馏近期 DSH 会话进知识库（先向我确认范围）'
 
 export function LintPanel({ openNote }: { openNote: (id: string, category: string, title: string) => void }) {
   const [report, setReport] = useState<LintReport | null>(null)
@@ -81,15 +80,6 @@ export function LintPanel({ openNote }: { openNote: (id: string, category: strin
     } finally { setBusy(null) }
   }
 
-  const doDistill = async () => {
-    try {
-      await navigator.clipboard.writeText(DISTILL_TRIGGER)
-      flash('触发指令已复制，粘贴到对话发送即可')
-    } catch {
-      flash(`复制失败，请手动发送：${DISTILL_TRIGGER}`, 'err')
-    }
-  }
-
   if (!report) return <div className="knj-statusbar" style={{ visibility: 'hidden' }}>·</div>
 
   const issues = report.orphans.length + report.brokenLinks.length + report.missingFrontmatter.length
@@ -106,9 +96,6 @@ export function LintPanel({ openNote }: { openNote: (id: string, category: strin
       <div className="knj-pop__row">
         <button type='button' className="knj-btn knj-btn--subtle" disabled={busy === 'rebuild'} onClick={doRebuild}>
           <IconRefresh size={14} />{busy === 'rebuild' ? '重建中…' : '重建索引'}
-        </button>
-        <button type='button' className="knj-btn knj-btn--subtle" onClick={doDistill}>
-          <IconSparkles size={14} />蒸馏近期会话
         </button>
       </div>
       <div className="knj-pop__row">
@@ -127,7 +114,7 @@ export function LintPanel({ openNote }: { openNote: (id: string, category: strin
           <IconImport size={14} />{busy === 'import' ? '导入中…' : '直接导入'}
         </button>
       </div>
-      <div className="knj-pop__hint">重建索引会重新生成 index.md；蒸馏会把触发指令复制到剪贴板。</div>
+      <div className="knj-pop__hint">重建索引会重新生成 index.md；蒸馏入口在边栏分段「知识蒸馏」。</div>
       {notice && <div className={`knj-banner ${notice.kind === 'ok' ? 'knj-banner--ok' : 'knj-banner--err'}`}>{notice.text}</div>}
     </div>}
 

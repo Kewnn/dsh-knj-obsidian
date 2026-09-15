@@ -92,6 +92,52 @@ v2 检索基于同一 `.wiki/` 知识库，提供**双通道**能力，均**只�
 
 无 dsh 工具的环境里，agent 按 `wiki-query/SKILL.md` 的流程用 grep / glob / read 完成同等检索，降级路径（无 grep、无 index.md、结果过多）见 `references/retrieval-guide.md`。skill 只读，发现新知识时路由到 `wiki_ingest` / `wiki_capture`。
 
+### 本地语义检索（`wiki_search_semantic`，进程内 QMD，严格离线）
+
+除关键词分层检索外，插件还提供**本地语义检索**工具 `wiki_search_semantic`：在 DSH 进程内直接使用 `@tobilu/qmd` 库（**不 spawn 命令、不走 MCP、无需单独安装或启动任何 QMD 插件**），只用两条不会联网的通道——本地嵌入模型向量检索 + BM25 关键词检索——并在本地做 RRF 融合。
+
+- 入参：`query`（必填）、`limit`（默认 8，硬上限 20）。
+- 返回：`status`（`ready` / `index-empty` / `index-stale` / `model-missing` / `library-missing`）+ `results[]`（id / category / title / snippet / score，score 为融合分数非概率）+ 必要的 `message`。
+- 页面引用从命中路径推导（`displayPath` / `qmd://` URI），**不使用 QMD 的 `docid`**（它是内容哈希）；只接受七个正式分类下的 `.md`，`_system/`、`_raw/`、`wiki-export/` 永远不会成为结果。
+
+**严格离线**：`@tobilu/qmd` 的混合检索默认会拉起 1.7B 查询扩展模型与 0.6B 精排模型（默认值为 `hf:` 云端 URI，缺失时会自动下载），因此插件**禁用这两条路径**——把它们钉到 `~/.dsh/qmd/models/` 下不存在的本地路径，任何误用只会在本地失败。索引与查询全程零网络。
+
+这一约束必须**双写**：既写进传给 `createStore` 的配置，也写进进程环境变量（`QMD_EMBED_MODEL` / `QMD_GENERATE_MODEL` / `QMD_RERANK_MODEL`）。原因是 QMD 的**分块**路径（`chunkDocumentByTokens` → `getDefaultLlamaCpp()` → `tokenize()`）走的是**模块级单例**，它不读 store 配置、只认环境变量与默认值——只设 config 时，单例会去解析默认的 `hf:` 云端模型并联网，表现为嵌入阶段无限等待（进程内存不涨、CPU 不动）。这一点已由 `semantic-index.test.mjs` 的「单例环境」用例锁死。
+
+**模型放置（一次性人工步骤，约 320 MB）**：
+
+```powershell
+# 目录不存在就建；插件不会自动下载，也不会联网
+mkdir -Force $env:USERPROFILE\.dsh\qmd\models
+# 把模型放到（文件名必须一致）：
+#   %USERPROFILE%\.dsh\qmd\models\embeddinggemma-300M-Q8_0.gguf
+# 可选手动下载：https://hf-mirror.com/ggml-org/embeddinggemma-300M-GGUF/resolve/main/embeddinggemma-300M-Q8_0.gguf
+```
+
+模型缺失时工具**如实回报未就绪**（给出精确路径与文件名），并且**不打开索引库**（不 import 库、不建 sqlite、不留句柄）；关键词检索 `wiki_query` 始终可用。语义状态固定在 `~/.dsh/qmd/`（`models/`、`index.sqlite`、`config.yml`），索引文件不进 vault。
+
+**内网 / 离线部署**：`@tobilu/qmd` 是插件的 **optionalDependency**——内网 npm 仓库没有它时，插件仍能正常安装，语义检索如实降级到 `wiki_query`，不会因为一个可选能力导致整个插件装不上。要让语义检索在内网可用，需要把这批 npm 包（win32-x64 CPU 集约 128 个包、约 205 MB）镜像进内网仓库；工具与清单在**源码仓库**的 `tools/qmd-offline/`（含 `README.md`、`packages.json` 与 `mirror-qmd.mjs` 的 `list/pack/verify` 命令），不随 npm 包分发。
+
+### 索引新鲜度与「更新索引」
+
+语义索引不会凭空存在，它需要**先建一次**：
+
+- **自动**：`wiki_ingest` 落盘后会安排一次 debounce（默认 15 秒）后台刷新，连续的批量入库合并成一次；同一库同时最多一次刷新（单飞）。待嵌入积压超过阈值（默认 500 篇）时**不自动跑**，而是如实回报「请点更新索引」，避免一次大批入库在后台悄悄占满 CPU 很久。
+- **手动**：边栏「语义索引」块里的 **「更新索引」** 按钮 → `POST /api/obsidian-wiki/semantic-update`（立刻返回 202，后台执行），状态由 `GET /api/obsidian-wiki/semantic-status` 轮询（重建期间每 2 秒），块内显示状态、已索引篇数、待嵌入篇数、进行中已用时间与上次结果。
+- **关掉自动刷新**（保留手动按钮）：环境变量 `KNJ_OBSIDIAN_AUTO_REFRESH=off`。
+- 模型未就位时状态块直接显示「模型未就位」与精确路径，按钮禁用——不会发一次注定无效的请求。
+
+**耗时预期**（本机 i7-12700H + RTX 3060，实测）：
+
+| 场景 | 实测 | 说明 |
+| --- | --- | --- |
+| 真实库 7 篇 | update 44ms + embed **86.7s** | 几乎全是一次性冷启动（模型加载 + 后端探测） |
+| 合成 300 篇 冷启动 | update 1.7s + embed **96.2s** | 冷启动成本与库大小基本无关 |
+| 合成 300 篇 **热态** | embed **11.9s** = **0.04s/篇（25 篇/秒）** | 稳态吞吐 |
+| 外推（稳态） | 500 篇 ≈ **0.3 分钟**，2000 篇 ≈ **1.3 分钟** | 首次另加约 1.5 分钟冷启动 |
+
+后端差异很大（`tools/bench-embed.mjs`，1053 token 文本）：CPU 饱和在 **51–56 token/秒**，Vulkan **3125–3400 token/秒（约 60 倍）**；本机 `auto` 会选 Vulkan，纯 CPU 机器的索引耗时应按两个数量级上调，因此**务必用可见的手动入口而不是静默后台**。注意 `QMD_LLAMA_GPU=cuda` 在离线环境不可用（会尝试 `git clone` llama.cpp），保持默认 `auto` 即可。
+
 ## v3：图谱导出
 
 v3 图谱基于同一 `.wiki/` 知识库构建 **wikilink 知识图谱**（节点=页面、边=`[[wikilink]]` 链接），提供 `wiki_export` 工具导出，只读（不修改任何页面）。
@@ -166,7 +212,7 @@ v5 解决笔记工作台的四个体验缺口（富渲染 / 双链导航 / 源�
 - **一键重建索引**：边栏「重建索引」→ `POST /rebuild-index`，从全部页面重生成 index.md（`- [[id]] 标题 — 摘要` 格式，retriever L1 零迁移兼容）。index.md 是派生工件——重建会覆盖手工注释，想保留的内容请写进页面本身
 - **导入现有 md**：边栏路径框（文件或目录）+ 分类选择 → `POST /import`。递归收集 .md（排除 node_modules/.git/target/dist，≤500 文件、单文件 ≤1MB、深度 ≤12）；已有合法 frontmatter 按声明原样入库，缺失的自动补全（id=文件名净化、title=首个标题、source=import:原路径）；id 冲突自动加 `-2` 后缀不覆盖；重导幂等（未变跳过、已变更新）；**源文件只读**
 - **lint 详情速修**：lint 徽标点击展开面板——断链/孤儿页/缺 frontmatter 逐条可点；断链打开来源页（修链在来源页），其余打开对应页，直接进源码态修
-- **会话蒸馏**：随包分发 `wiki-distill` skill（内嵌 zstd 多帧会话提取器，首次运行落位 `<vault>/_system/tools/`，vault 已有则用 vault 版）；边栏「蒸馏近期会话」按钮复制触发指令到剪贴板，粘贴到对话发送即可。原始会话归档写入 `<vault>/_system/dsh-sessions/`，不参与知识检索；流程：确认范围（默认近 3 天当前项目）→ 提取 → 按主题蒸馏 → `wiki_ingest` 入库（contentHash 增量，重复源自动跳过）
+- **会话蒸馏**：随包分发 `wiki-distill` skill（内嵌 zstd 多帧会话提取器，首次运行落位 `<vault>/_system/tools/`，vault 已有则用 vault 版）；入口在边栏「知识蒸馏」分段（选项「近期会话蒸馏」，可选近 3/7/30 天），点击把触发指令预填进当前对话。原始会话归档写入 `<vault>/_system/dsh-sessions/`，不参与知识检索；流程：确认范围（默认近 3 天当前项目）→ 提取 → 按主题蒸馏 → `wiki_ingest` 入库（contentHash 增量，重复源自动跳过）
 - **新端点安全**：两个新写端点沿用 v5 模式（同源 403 / 非 JSON 415）；import 对源路径只读，写入落点经 SAFE_ID 净化 + vault 包含性双校验
 
 ## v7：多 vault 管理
@@ -210,15 +256,88 @@ v9 把「本地工程代码 → 知识页」做成 **agent 会话驱动**的采�
   枚举/常量（→ dictionaries）与 SQL DDL/MyBatis/JPA 表结构（→ tables）并对账存量知识
   （new/changed/unchanged/deleted + 同名近似页提醒），蒸馏后经 `wiki_ingest` 直接入库
   （contentHash 增量跳过、未知/推断保持 unknown/inferred、不覆盖他源页面、不读会话归档）
-- **GUI 启动器**：边栏「知识库」→「代码采集」分段——选择范围（枚举/常量字典 / 表结构 / 全部）
-  后点「预填当前对话开始采集」，宿主把触发指令填入当前对话输入框（可见可编辑，回车即发送给
-  Agent）；宿主不支持预填时退化为「复制触发指令」自行粘贴
+- **GUI 启动器（知识蒸馏）**：边栏「知识库」→「知识蒸馏」分段——五个选项：**枚举/常量字典**、
+  **表结构**、**系统功能挖掘**（**预留位**：将由 3 个 skill 组合完成——代码结构 → 关系/调用 →
+  功能聚合，本机暂未安装；选中时标注「预留」并禁用动作，不生成会失败的指令；
+  需要字典 + 表结构时可分别选前两项各跑一次）、**近期会话蒸馏**（可选近 3/7/30 天）、
+  **指定会话蒸馏**（**复选**一个或多个会话）。点「**新建会话并预填**」——插件会新建一个会话
+  （cwd = 当前库根目录）并切过去，把触发指令预填进**新会话**的输入框（可见可编辑，回车即发送给
+  Agent），**不会打扰你当前正在聊的会话**；宿主不支持新建会话时退化为「复制触发指令」自行粘贴。
+  代码侧走 `wiki-collect`，会话侧走 `wiki-distill`
+- **指定会话蒸馏**：会话列表默认**收起**，展开后可**搜索过滤**、限高滚动、一键全选当前结果，已选 id 常驻显示并可清空；列表不可用时退化为粘贴 session id（逗号分隔多个）。提取器新增第 6 参数按会话 id 过滤（`sessionIncluded`，逗号分隔可多个），
+  指令显式把时间下限设为 `1970-01-01T00:00:00Z` 以忽略 mtime 过滤（否则老会话会被漏掉），
+  入库 `source=session:<id>` + contentHash 去重；提取器自测已纳入主套件
+  （`wiki-distill-extractor.test.mjs` 包装 `wiki-distill/extract-dsh-sessions.test.cjs`）
+- **会话蒸馏并入同一入口**：近期会话蒸馏由「当前工作区 + 时间范围」驱动（原有 `wiki-distill`
+  skill 与提取器不动）；底部「工具」面板不再保留重复的复制式蒸馏按钮
 - **诚实范围披露**：支持 Java enum、Java public static final、SQL DDL、MyBatis XML、JPA Entity；
-  不支持 TypeScript / Python / Go / 任意 ORM / JSON Schema（UI 与 skill 均写明）
+  不支持 TypeScript / Python / Go / 任意 ORM / JSON Schema（UI 与 skill 均写明）；会话侧声明
+  原始归档只写入 `<vault>/_system/dsh-sessions/`、不读其他工作区会话、不参与检索
 - **授权模型**：GUI 点击 = 显式触发（= 授权）；skill 内部直接入库，不设中间草稿/确认状态机；
   报告在会话中可见，用户可随时打断；未来 git 分支合并作为写入把关（预留扩展位，未实现）
 - **快速导入（直接写入）**：底部「工具」面板的 md 导入保留 API 兼容，UI 标注为
   「快速导入（直接写入）——跳过受审阅流程与哈希校验」，为高级路径
+
+## v10：初始化知识库（工作区无库时）
+
+v10 解决「工作区里还没有知识库」的场景，并纠正一个误导：**注册 ≠ 建库**。
+
+- **新增 agent 工具 `wiki_init`**：为当前库创建 `.wiki` 脚手架（`index.md`、`.manifest.json`、
+  concepts/entities/references/synthesis/projects/dictionaries/tables 七个目录），幂等
+  （已存在时 `created=false` 且只补缺失结构），返回 `root` / `wikiRoot` / `created` / `pageCount`；
+  只接受当前库或已注册库根目录，其他路径报错并提示先在边栏新建/挂接
+- **GUI 初始化入口（触发 agent）**：当前库未初始化时，边栏身份区显示「未初始化」徽标 +
+  「初始化知识库」按钮，启动器也给出同款引导；点击会**新建会话**并把初始化指令预填进该新会话
+  （复制兜底），由 Agent 调 `wiki_init` 建库并回报路径——GUI 自身不写盘
+- **取消静默建库**：`/vault/activate`（跟随工作区）改为**只登记 + 切换当前库，不再自动创建 `.wiki`**；
+  建库只发生在显式动作：`wiki_init`、显式 `attach`（新建/挂接），或首次真实写入（写入必须建目录）
+- **库列表暴露 initialized**：`GET /vaults` 每个库返回 `initialized`（磁盘是否已有 `.wiki`），
+  于是 `Documents`、`profiles/web` 这类「有登记、无目录」的幽灵库会被如实标为未初始化，
+  而不是看起来像一个空库
+- **内置 `wiki-init` skill**（`wiki-init/SKILL.md`，随包分发）：初始化流程与边界说明
+  （只建结构、不采集不写页；结构以插件为准——没有 `_raw/`、`.obsidian/`、`.env`，那是另一套
+  obsidian-wiki 项目）
+
+## v12：还原点与批次质量凭证（对抗审查后加固）
+
+v12 按对抗审查结论给「知识蒸馏」补上可回滚与可评估能力，并修掉若干真实缺陷：
+
+- **还原点（checkpoint）**：新增 agent 工具 `wiki_checkpoint` / `wiki_checkpoints` 与路由
+  `GET /checkpoints`、`POST /checkpoint/restore`；快照落在 `.wiki/_system/checkpoints/<ts>/`
+  （七分类页面 + index.md + .manifest.json）。蒸馏批次**必须**先建还原点，质量不佳时在
+  「知识蒸馏 → 还原点」一键整库回滚（快照后新增/修改的页面会随之回退）。
+  还原点 id 有严格格式校验，**拒绝路径穿越**（`../` 之类的 id 直接 400）。
+- **批次纪律（写入指令内置，skill 同步）**：① 建还原点 → ② 先用 `wiki_query` 查重（已有同主题页就**更新**而不是新建，防 `-2` 堆积）→ ③ **写前先列清单**（将创建/更新哪些页，等确认再写）→ ④ `wiki_ingest` → ⑤ **质量评估报告**（还原点 id、逐页 id/category/confidence/新增 wikilink 数、查重决策、孤儿与推断占比风险）。
+- **幂等修正**：会话蒸馏的 `contentHash` 改为**逐会话摘要哈希**（原用 catalog.json 整体哈希，
+  滑动窗口每天变会重蒸旧会话）；`source` 改为 `session:<id>` 或稳定主题 slug，
+  **禁止日期区间 source**（那会把更新变成新建 `-2`）。
+- **工作区硬约束**：`project-filter`（`--D-workspace-xxx--`）与 sessions 根由插件算好写进指令，
+  agent 不再自行推导；切换知识库时启动器刷新并清空旧库的会话选择。
+- **只读路径零写副作用**：`wiki_query` / `wiki_lint` / `wiki_checkpoints` 改用 `currentReadonly()`，
+  `/vault/*`、`/checkpoints` 等非写页端点不再 `ensure()`——不再出现“查询即建库”。
+- **索引自动重建**：`wiki_ingest` 写完立即重建 index.md（派生工件），L1 检索不再滞后。
+- **原子写**：`writePage` 与 manifest 落盘改为 tmp+rename；新增合并写 `updateManifestMerged`，
+  降低崩溃/多进程共用库导致的半截文件与条目丢失。
+- **图谱配色补全**：dictionaries / tables 两类在 graph.html 有独立颜色与图例（此前与默认灰同色、图例缺失）。
+- **检索修复**：L1 index-only 检索补齐 dictionaries / tables 两类（此前会漏掉字典与表结构页）。
+- **导入边界**：`POST /import` 只允许导入**已注册库根目录内**的 Markdown（库外路径 400），
+  避免同源脚本借导入把任意目录的 `.md` 拉进可检索知识库。
+- **会话过滤更严**：提取器会话过滤改为「精确或前缀匹配」（不再是任意子串），避免片段误命中无关会话；
+  skill 要求逐字节比对提取器版本，版本不一致时用 skill 版本覆盖（否则“指定会话蒸馏”会退化成整范围）。
+- **预填不覆盖用户输入**：新建会话预填的重试循环在检测到用户已开始输入时立即停手。
+- **`wiki_init` 去掉无意义参数**：只初始化当前库（原 `root` 参数必然报错）。
+
+- **Obsidian 适配**：`ensure()` 会写 `.wiki/.obsidian/app.json` 的 `userIgnoreFilters`，排除
+  `_system/`、`_raw/`、`wiki-export/`、`.manifest.json` —— 把 `.wiki` 直接当 Obsidian vault 打开时，
+  会话归档与派生工件不再进搜索/图谱；已有 `app.json` 只做并集合并，不覆盖用户自定义。
+- **单一写入授权规则**（消除此前自相矛盾）：授权 = 用户显式触发（点启动器 / 对话里明确要求）；
+  入库前**必做**还原点 + 输出写前清单（**信息性预览：列完即继续，不阻塞等待确认**）；写后**必做**
+  质量评估报告；把关 = 还原点一键回滚 + 报告 + 将来的 git 分支合并。启动器与 `wiki-collect` /
+  `wiki-distill` 三方表述一致，且由 `knowledge-distill.test.mjs` 断言（禁止再出现“等确认”式措辞）。
+- **内部状态豁免与知识面隔离**：还原点 / 挖掘进度 / 会话归档存放于 `_system/`（可经专用工具与路由枚举），
+  但**不得**出现在 `pages` / 检索 / 图谱 / 图谱导出 / `index.md`；会话蒸馏读取 `.zstd` 归档属**明确豁免**
+  （只读输入，产物仍是 Markdown 知识页）。`integrity.test.mjs` 覆盖：跨源不覆盖 + 同源 `-N` 复用、
+  页面原子写无 tmp 残留、L1 index-only 覆盖 dictionaries/tables、`_system` 不进任何知识面。
 
 ## 路线
 
@@ -228,17 +347,18 @@ v9 把「本地工程代码 → 知识页」做成 **agent 会话驱动**的采�
 - ~~**编辑**~~ ✅ 已上线：富渲染 + 双链导航 + 源码视图 + 全文编辑（v5）
 - ~~**历史会话挖掘**~~ ✅ 已上线：wiki-distill skill + 边栏蒸馏按钮（v6）
 - ~~**vault 跟随项目**~~ ✅ 已上线：多库管理 + 跟随工作区（v7）——当前库身份、库列表/切换、新建/挂接/移除、注册表持久化
-- ~~**代码结构采集**~~ ✅ 已上线：GUI 启动器 + 内置 wiki-collect skill（v9）——点击预填当前对话 → agent 扫描对账 → 直接入库
+- ~~**知识蒸馏**~~ ✅ 已上线：边栏「知识蒸馏」统一启动器（v9/v10/v11）——枚举/常量字典、表结构、全部、近期会话蒸馏（近 3/7/30 天）、指定会话蒸馏（复选）；点击**新建会话**并预填 → agent 用 wiki-collect / wiki-distill 入库
+- ~~**初始化知识库**~~ ✅ 已上线：`wiki_init` 工具 + `wiki-init` skill + GUI 初始化入口（v10）——无库工作区显式初始化，取消静默建库
 
 ## 开发
 
 ```bash
 npm run check   # typecheck + build（服务端）
 npm run check:client && npm run build:client   # 客户端类型检查 + bundle
-node --test *.test.mjs   # 全部测试（186 例；含 collection-client 启动器契约）
+node --test *.test.mjs   # 全部测试（191 例；含 collection-client 启动器契约与 vault-init 初始化契约）
 ```
 
-> 已知基线：`wiki_ingest` 的 `relatedCheck` 输出是 master 工作树中尚未收尾的 WIP（`src/tools.ts` 已新增输出但 `ingest-delta.test.mjs` / `tools.test.mjs` 断言未同步），与 v9 功能无关；相关 8 例在 master 原工作树同样失败。
+> 已知基线：`wiki_ingest` 的 `relatedCheck` 输出是 master 工作树中尚未收尾的 WIP（`src/tools.ts` 已新增输出但 `ingest-delta.test.mjs` / `tools.test.mjs` 断言未同步），与 v9/v10 功能无关；相关 8 例在 master 原工作树同样失败。
 
 ## License
 

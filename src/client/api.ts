@@ -115,6 +115,8 @@ export interface VaultInfo {
 
 export interface VaultListEntry extends VaultInfo {
   pageCount: number
+  /** 磁盘上是否已有 .wiki（注册 ≠ 建库；false 时 UI 提供「初始化知识库」入口） */
+  initialized: boolean
 }
 
 export interface VaultsResponse {
@@ -146,10 +148,75 @@ export const attachVault = (root: string, name?: string): Promise<VaultsResponse
 
 export const removeVault = (id: string): Promise<VaultsResponse> => postVault('remove', { id })
 
+// ---------- 还原点（checkpoint） ----------
+export interface CheckpointMeta { id: string; createdAt: string; pageCount: number }
+
+export async function fetchCheckpoints(): Promise<CheckpointMeta[]> {
+  const data = await getJson<{ checkpoints: CheckpointMeta[] }>(`${BASE}/checkpoints`)
+  return data.checkpoints
+}
+
+/** 从还原点回滚（同源 JSON POST）。
+ *  mode 默认 `merge`（非破坏性：只撤销快照内页面的修改，保留快照后新增页）；
+ *  `exact` = 整库回到快照（会删除快照后新增页），需显式传入。 */
+export async function restoreCheckpoint(id: string, mode: 'merge' | 'exact' = 'merge'): Promise<{ pageCount: number; restored: number; keptNewer: number; mode: string }> {
+  const res = await fetch(`${BASE}/checkpoint/restore`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, mode }),
+  })
+  const data = await res.json() as { pageCount?: number; restored?: number; keptNewer?: number; mode?: string; error?: string }
+  if (!res.ok || data.error) throw new Error(data.error ?? `restore failed: ${res.status}`)
+  return { pageCount: data.pageCount ?? 0, restored: data.restored ?? 0, keptNewer: data.keptNewer ?? 0, mode: data.mode ?? mode }
+}
+
 /** 取单个知识页（非 raw）。 */
 export async function fetchPage(id: string, category: string): Promise<WikiPage> {
   const res = await fetch(`${BASE}/page?id=${encodeURIComponent(id)}&category=${encodeURIComponent(category)}`)
   const data = await res.json() as { page?: WikiPage; error?: string }
   if (!res.ok || data.error || !data.page) throw new Error(data.error ?? `page api: ${res.status}`)
   return data.page
+}
+
+// ---------- v8 本地语义索引（严格离线） ----------
+
+export interface SemanticRefreshRun {
+  ok: boolean
+  at: string
+  documents: number
+  chunks: number
+  durationMs: number
+  note?: string
+}
+
+export interface SemanticStatus {
+  available: boolean
+  modelPresent: boolean
+  indexState: 'ready' | 'index-empty' | 'index-stale'
+  documents: number
+  pendingEmbedding: number
+  hasVectorIndex: boolean
+  refreshing: boolean
+  startedAt?: string
+  elapsedMs?: number
+  /** 本进程内实测的一次冷启动耗时（首次刷新），用于给出「约 N 秒」的估算。 */
+  coldStartMs?: number
+  lastRun?: SemanticRefreshRun
+  note?: string
+}
+
+export function fetchSemanticStatus(): Promise<SemanticStatus> {
+  return getJson(`${BASE}/semantic-status`)
+}
+
+/** 触发后台重建索引（立刻返回；进度靠 fetchSemanticStatus 轮询）。 */
+export async function triggerSemanticUpdate(): Promise<{ started: boolean; running: boolean; status: SemanticStatus }> {
+  const res = await fetch(`${BASE}/semantic-update`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{}',
+  })
+  const data = await res.json() as { started?: boolean; running?: boolean; status?: SemanticStatus; error?: string }
+  if (!res.ok || data.error) throw new Error(data.error ?? `semantic update failed: ${res.status}`)
+  return { started: data.started ?? false, running: data.running ?? false, status: data.status as SemanticStatus }
 }

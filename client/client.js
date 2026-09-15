@@ -87,12 +87,54 @@ window.__ModuleLoader__.load({
 			name: name.trim()
 		} : { root });
 		const removeVault = (id) => postVault("remove", { id });
+		async function fetchCheckpoints() {
+			return (await getJson(`${BASE}/checkpoints`)).checkpoints;
+		}
+		/** 从还原点回滚（同源 JSON POST）。
+		*  mode 默认 `merge`（非破坏性：只撤销快照内页面的修改，保留快照后新增页）；
+		*  `exact` = 整库回到快照（会删除快照后新增页），需显式传入。 */
+		async function restoreCheckpoint(id, mode = "merge") {
+			const res = await fetch(`${BASE}/checkpoint/restore`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id,
+					mode
+				})
+			});
+			const data = await res.json();
+			if (!res.ok || data.error) throw new Error(data.error ?? `restore failed: ${res.status}`);
+			return {
+				pageCount: data.pageCount ?? 0,
+				restored: data.restored ?? 0,
+				keptNewer: data.keptNewer ?? 0,
+				mode: data.mode ?? mode
+			};
+		}
 		/** 取单个知识页（非 raw）。 */
 		async function fetchPage(id, category) {
 			const res = await fetch(`${BASE}/page?id=${encodeURIComponent(id)}&category=${encodeURIComponent(category)}`);
 			const data = await res.json();
 			if (!res.ok || data.error || !data.page) throw new Error(data.error ?? `page api: ${res.status}`);
 			return data.page;
+		}
+		function fetchSemanticStatus() {
+			return getJson(`${BASE}/semantic-status`);
+		}
+		/** 触发后台重建索引（立刻返回；进度靠 fetchSemanticStatus 轮询）。 */
+		async function triggerSemanticUpdate() {
+			const res = await fetch(`${BASE}/semantic-update`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: "{}"
+			});
+			const data = await res.json();
+			if (!res.ok || data.error) throw new Error(data.error ?? `semantic update failed: ${res.status}`);
+			return {
+				started: data.started ?? false,
+				running: data.running ?? false,
+				status: data.status
+			};
 		}
 		//#endregion
 		//#region src/client/icons.tsx
@@ -467,7 +509,8 @@ window.__ModuleLoader__.load({
 		* v6/v7 底部状态条 + 展开面板（设计 v2）：
 		* - 常驻：页数 + 健康状态点（绿/琥珀/红三态）
 		* - 「问题」展开：断链 / 孤儿页 / 缺 frontmatter 逐条可点跳转
-		* - 「工具」展开：重建索引 / 蒸馏近期会话 / 导入 md（原顶部工具条移入，释放主视觉）
+		* - 「工具」展开：重建索引 / 导入 md（原顶部工具条移入，释放主视觉）
+		*   v10 起：会话蒸馏入口移到边栏分段「会话蒸馏」（预填/复制启动器），此处不再重复
 		*/
 		const CATEGORIES = [
 			{
@@ -499,7 +542,6 @@ window.__ModuleLoader__.load({
 				label: "数据结构"
 			}
 		];
-		const DISTILL_TRIGGER = "用 wiki-distill 蒸馏近期 DSH 会话进知识库（先向我确认范围）";
 		function LintPanel({ openNote }) {
 			const [report, setReport] = (0, react.useState)(null);
 			const [toolsOpen, setToolsOpen] = (0, react.useState)(false);
@@ -566,14 +608,6 @@ window.__ModuleLoader__.load({
 					setBusy(null);
 				}
 			};
-			const doDistill = async () => {
-				try {
-					await navigator.clipboard.writeText(DISTILL_TRIGGER);
-					flash("触发指令已复制，粘贴到对话发送即可");
-				} catch {
-					flash(`复制失败，请手动发送：${DISTILL_TRIGGER}`, "err");
-				}
-			};
 			if (!report) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 				className: "knj-statusbar",
 				style: { visibility: "hidden" },
@@ -590,20 +624,15 @@ window.__ModuleLoader__.load({
 				toolsOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 					className: "knj-pop",
 					children: [
-						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 							className: "knj-pop__row",
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 								type: "button",
 								className: "knj-btn knj-btn--subtle",
 								disabled: busy === "rebuild",
 								onClick: doRebuild,
 								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconRefresh, { size: 14 }), busy === "rebuild" ? "重建中…" : "重建索引"]
-							}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
-								type: "button",
-								className: "knj-btn knj-btn--subtle",
-								onClick: doDistill,
-								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconSparkles, { size: 14 }), "蒸馏近期会话"]
-							})]
+							})
 						}),
 						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 							className: "knj-pop__row",
@@ -652,7 +681,7 @@ window.__ModuleLoader__.load({
 						}),
 						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 							className: "knj-pop__hint",
-							children: "重建索引会重新生成 index.md；蒸馏会把触发指令复制到剪贴板。"
+							children: "重建索引会重新生成 index.md；蒸馏入口在边栏分段「知识蒸馏」。"
 						}),
 						notice && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 							className: `knj-banner ${notice.kind === "ok" ? "knj-banner--ok" : "knj-banner--err"}`,
@@ -5549,7 +5578,158 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 			});
 		}
 		//#endregion
-		//#region src/client/CodeCollectLauncher.tsx
+		//#region src/client/SemanticIndexPanel.tsx
+		/** 状态词 → 面向用户的短句（不把内部枚举直接抛给用户）。 */
+		const STATE_LABEL = {
+			ready: "就绪",
+			"index-stale": "有未嵌入的新页",
+			"index-empty": "索引为空"
+		};
+		function formatSeconds(ms) {
+			if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "";
+			if (ms < 1e3) return "不到 1 秒";
+			const seconds = Math.round(ms / 1e3);
+			return seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
+		}
+		/**
+		* 本地语义索引状态块：模型是否就位、已索引多少页、还差多少页、是否正在重建，以及「更新索引」。
+		*
+		* 为什么必须是一个显式按钮：真实库首次重建包含模型加载（本机实测冷启动约 1.5 分钟，之后约 40ms/篇），
+		* 不能让它变成界面上一次没有解释的卡顿；进度靠轮询 status（待嵌入数在下降）。
+		*/
+		function SemanticIndexPanel() {
+			const [status, setStatus] = (0, react.useState)(null);
+			const [message, setMessage] = (0, react.useState)("");
+			const [busy, setBusy] = (0, react.useState)(false);
+			const [tick, setTick] = (0, react.useState)(0);
+			const aliveRef = (0, react.useRef)(true);
+			(0, react.useEffect)(() => {
+				aliveRef.current = true;
+				const load = () => {
+					fetchSemanticStatus().then((s) => {
+						if (aliveRef.current) setStatus(s);
+					}).catch(() => {
+						if (aliveRef.current) setStatus(null);
+					});
+				};
+				load();
+				const onFocus = () => load();
+				window.addEventListener("focus", onFocus);
+				window.addEventListener("wiki:pages-changed", load);
+				window.addEventListener("wiki:vault-changed", load);
+				return () => {
+					aliveRef.current = false;
+					window.removeEventListener("focus", onFocus);
+					window.removeEventListener("wiki:pages-changed", load);
+					window.removeEventListener("wiki:vault-changed", load);
+				};
+			}, []);
+			(0, react.useEffect)(() => {
+				if (!status?.refreshing) return;
+				const timer = setInterval(() => {
+					setTick((v) => v + 1);
+					fetchSemanticStatus().then((s) => {
+						if (!aliveRef.current) return;
+						setStatus(s);
+						if (!s.refreshing) setMessage(s.lastRun?.ok ? `索引已更新：${s.lastRun.documents} 篇 / ${s.lastRun.chunks} 块，用时 ${formatSeconds(s.lastRun.durationMs)}` : s.lastRun?.note ?? "索引更新结束，但没有可报告的细节");
+					}).catch(() => {});
+				}, 2e3);
+				return () => clearInterval(timer);
+			}, [status?.refreshing]);
+			const update = async () => {
+				setBusy(true);
+				setMessage("");
+				try {
+					const result = await triggerSemanticUpdate();
+					setStatus(result.status);
+					setMessage(result.running ? "正在重建索引（首次包含模型加载，通常 1–2 分钟）…" : result.status.note ?? "已提交，但未开始");
+				} catch (error) {
+					setMessage(`更新索引失败：${error instanceof Error ? error.message : String(error)}`);
+				} finally {
+					setBusy(false);
+				}
+			};
+			const pending = status?.pendingEmbedding ?? 0;
+			const elapsed = status?.refreshing ? formatSeconds((status.elapsedMs ?? 0) + tick * 2e3) : "";
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "knj-vcol",
+				style: { gap: 4 },
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "knj-pop__row",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "knj-hrow",
+							style: { gap: 6 },
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									style: { fontWeight: 500 },
+									children: "语义索引"
+								}),
+								status === null && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "knj-pop__hint",
+									children: "状态未知"
+								}),
+								status !== null && !status.modelPresent && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "knj-pop__hint",
+									children: "模型未就位"
+								}),
+								status !== null && status.modelPresent && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									className: "knj-pop__hint",
+									children: [
+										STATE_LABEL[status.indexState],
+										" · ",
+										status.documents,
+										" 篇",
+										pending > 0 ? ` · 待嵌入 ${pending} 篇` : ""
+									]
+								}),
+								status?.refreshing && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									className: "knj-pop__hint",
+									children: ["正在重建", elapsed ? `（已用 ${elapsed}）` : ""]
+								})
+							]
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "knj-btn knj-btn--sm",
+							onClick: update,
+							disabled: busy || status?.refreshing === true || status?.modelPresent === false,
+							title: status?.modelPresent === false ? "本地嵌入模型未就位：按下方提示放入模型文件后再更新" : "重建本地语义索引（不联网）",
+							children: status?.refreshing ? "重建中…" : "更新索引"
+						})]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "knj-pop__hint",
+						children: [
+							"本地语义检索用 300M 嵌入模型在本机运行，全程不联网；检索工具为 ",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: "wiki_search_semantic" }),
+							"。",
+							status?.modelPresent && status.coldStartMs !== void 0 && ` 首次重建含模型加载（本机约 ${formatSeconds(status.coldStartMs)}），之后约 40 毫秒/篇。`
+						]
+					}),
+					status?.modelPresent === false && status.note && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "knj-pop__hint",
+						children: status.note
+					}),
+					status?.lastRun?.note && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "knj-pop__hint",
+						children: status.lastRun.note
+					}),
+					message && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "knj-banner knj-banner--info",
+						style: { color: "var(--knj-text)" },
+						children: message
+					})
+				]
+			});
+		}
+		//#endregion
+		//#region src/client/KnowledgeDistillLauncher.tsx
+		/** 路径归一化（比较用）：统一斜杠、去尾斜杠、忽略大小写。 */
+		function normPath(p) {
+			return (p ?? "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+		}
+		/** 列表一次最多渲染多少条（其余靠搜索缩小；避免几百个会话撑爆面板）。 */
+		const MAX_RENDERED_SESSIONS = 50;
 		const SCOPE_LABELS = [
 			{
 				value: "enum",
@@ -5563,43 +5743,274 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 			},
 			{
 				value: "both",
-				label: "全部",
-				detail: "字典 + 表结构一次采集"
+				label: "系统功能挖掘",
+				detail: "预留：由 3 个 skill 组合完成（代码结构 → 关系/调用 → 功能聚合），本机暂未安装这些 skill",
+				reserved: true
+			},
+			{
+				value: "sessions",
+				label: "会话蒸馏",
+				detail: "当前工作区的 DSH 会话 → 按主题蒸馏入库。默认按时间范围；也可在下方复选指定会话，只蒸所选（忽略时间范围，按会话 id 过滤）"
 			}
 		];
-		/** 启动器触发指令（引用内置 wiki-collect skill；GUI 不产生任何草稿/状态机）。 */
-		function buildTrigger(kind) {
+		/** 预留范围的说明（选中时不生成任何会失败的指令）。 */
+		const RESERVED_NOTICE = "「系统功能挖掘」是预留位：需要 3 个 skill 组合（代码结构采集 + 关系/依赖 + 功能聚合），本机尚未安装。装好后在此接入；当前可先用「枚举/常量字典」与「表结构」分别采集。";
+		const RANGE_LABELS = [
+			{
+				value: "3",
+				label: "近 3 天"
+			},
+			{
+				value: "7",
+				label: "近 7 天"
+			},
+			{
+				value: "30",
+				label: "近 30 天"
+			}
+		];
+		/** 库根 → sessionsRoot 下的项目目录转义形态（盘符:与路径分隔符替换为 -，两端加 --）。
+		*  由插件算好写进指令，不让 agent 猜。例：D:\workspace\iobs_pro → --D-workspace-iobs_pro-- */
+		function projectFilterOf(root) {
+			if (!root) return "(未知)";
+			return "--" + root.replace(/[:\\/]+/g, "-") + "--";
+		}
+		const SESSIONS_ROOT_HINT = "%USERPROFILE%\\.dsh\\sessions（Windows；即 ~/.dsh/sessions）";
+		/** 通用批次纪律：还原点 → 查重 → 写前清单（信息性预览）→ 入库 → 质量评估报告。
+		*  单一写入规则：按用户决策**不做阻塞式二次确认**（点击启动器 = 授权）；
+		*  写前清单是“看得见、可打断”的信息性预览，列完即继续，不等待确认回复。 */
+		const BATCH_DISCIPLINE = [
+			"批次纪律（必须按序执行，不得跳步）：",
+			"1) 【还原点】入库前先调用 wiki_checkpoint 工具创建还原点，记下返回的 id；",
+			"2) 【查重】对每个将要产出的主题页，先用 wiki_query 检索同名/近似页：已存在 → 更新该页（保留 created），不要新建；确实没有 → 才新建；",
+			"3) 【写前清单】写入任何页之前，先在对话里列出清单：将创建 X 页 / 更新 Y 页（每页一行：id、category、一句话理由、来源）。",
+			"   这是信息性预览（本流程不做阻塞式二次确认）：列完即继续执行 wiki_ingest，用户可随时打断；",
+			"4) 【入库】wiki_ingest 逐页写入，每页带 contentHash；",
+			"5) 【质量评估报告】完成后输出结构化报告（这是批次的质量凭证）：还原点 id、创建/更新页清单（id、category、confidence、新增 [[wikilink]] 数）、查重决策（复用了哪些既有页）、跳过项与原因；若质量不佳，用户可凭还原点 id 在边栏「知识蒸馏 → 还原点」一键回滚。"
+		].join("\n");
+		/** 代码结构采集指令（引用内置 wiki-collect skill）。 */
+		function buildCollectTrigger(scope) {
 			return [
 				"请使用内置 wiki-collect skill 在当前工作区执行代码结构采集：",
-				`采集类型 = ${kind}（enum=Java 枚举/常量字典；db=SQL DDL/MyBatis/JPA 表结构；both=全部）。`,
-				"步骤：用 wiki_mine 扫描并对账存量知识（new/changed/unchanged/deleted，含同名近似页提醒）→ 蒸馏 → 直接 wiki_ingest 入库。",
+				`采集类型 = ${scope}（enum=Java 枚举/常量字典；db=SQL DDL/MyBatis/JPA 表结构）。`,
+				"步骤：用 wiki_mine 扫描并对账存量知识（new/changed/unchanged/deleted，含同名近似页提醒）→ 蒸馏 → 入库。",
 				"规则：仅支持 Java enum、Java public static final、SQL DDL、MyBatis XML、JPA Entity；不支持 TypeScript/Python/Go/任意 ORM/JSON Schema。",
 				"不得读取 .dsh 会话归档等非代码源；未知/推断字段保持 unknown/inferred，不得补造成事实；不得覆盖他源页面。",
-				"完成后报告：本批 new/changed/unchanged/deleted 数量、入库页数与剩余模块（如有）。"
+				BATCH_DISCIPLINE,
+				"完成后按第 5 步格式输出质量评估报告。"
 			].join("\n");
 		}
-		/** GUI 采集启动器：只把触发指令交给当前对话 Agent（预填输入框），复制为兜底。 */
-		function CodeCollectLauncher({ sendToAgent }) {
-			const [kind, setKind] = (0, react.useState)("both");
+		/** 近期会话蒸馏指令（引用内置 wiki-distill skill，按时间范围；限定当前工作区）。 */
+		function buildDistillTrigger(range, vaultRoot) {
+			return [
+				`请使用内置 wiki-distill skill 蒸馏【当前工作区/知识库】近 ${range} 天的 DSH 会话进知识库：`,
+				`范围限定：当前知识库根目录 ${vaultRoot ?? "(未知)"}；工作区与知识库一一对应——只蒸这个工作区的会话。`,
+				`硬约束（插件已算好，直接使用，不要自行推导）：sessions 根 = ${SESSIONS_ROOT_HINT}；`,
+				`  项目过滤 = ${projectFilterOf(vaultRoot)}（库根的转义形态）。`,
+				`时间下限 = 现在往前 ${range} 天的 ISO 时间（提取器第 5 参数）。`,
+				"入库 source 逐会话用 `session:<会话id>`，contentHash 用【该会话自己的摘要内容哈希】（不是 catalog 整体哈希）——",
+				"这样同一会话重复蒸馏自动跳过，滑动窗口推移也不会重蒸旧会话。",
+				BATCH_DISCIPLINE,
+				"边界：原始会话归档只写入 <vault>/_system/dsh-sessions/，不参与知识检索；不读取其他工作区/项目的会话；",
+				"不得把会话原文整段抄成页面，只沉淀可复用结论；未知/不确定内容标注 inferred，不得写成事实。",
+				"完成后按第 5 步格式输出质量评估报告（含逐会话产出明细）。"
+			].join("\n");
+		}
+		/** 指定若干会话蒸馏：提取器第 6 参数按会话 id 过滤（逗号分隔），且不使用时间下限；同样限定当前工作区。 */
+		function buildSelectedSessionsTrigger(ids, vaultRoot) {
+			const list = ids.join(",");
+			return [
+				`请使用内置 wiki-distill skill 只蒸馏【指定会话】共 ${ids.length} 个（当前知识库「${vaultRoot ?? "(未知)"}」，不蒸馏其它会话）：`,
+				`会话 id：${ids.join("、")}`,
+				`硬约束（插件已算好，直接使用）：sessions 根 = ${SESSIONS_ROOT_HINT}；项目过滤 = ${projectFilterOf(vaultRoot)}。`,
+				"1) 用会话提取器时把会话 id 列表作为第 6 个过滤参数（逗号分隔），并把时间下限显式设为 1970-01-01T00:00:00Z（忽略时间下限，避免老会话被 mtime 过滤掉）：",
+				`   node <vault>/_system/tools/extract-dsh-sessions.cjs ${SESSIONS_ROOT_HINT} <vault>/_system/dsh-sessions ${JSON.stringify(projectFilterOf(vaultRoot))} 1970-01-01T00:00:00Z "${list}"`,
+				"2) 只蒸馏这些会话；每会话入库 source=`session:<id>`，contentHash 用【该会话自己的摘要内容哈希】（逐会话判重，重复自动跳过）；",
+				BATCH_DISCIPLINE,
+				"边界：不读取其它工作区会话；原始归档只落 <vault>/_system/dsh-sessions/，不参与检索；未知内容标注 inferred。",
+				"完成后按第 5 步格式输出质量评估报告（逐会话列出 id 与产出明细）。"
+			].join("\n");
+		}
+		function parseManualIds(text) {
+			return text.split(",").map((s) => s.trim()).filter(Boolean);
+		}
+		/** 知识蒸馏启动器：代码结构采集 / 会话蒸馏统一入口，新建会话把指令交给 Agent。 */
+		function KnowledgeDistillLauncher({ startAgentSession, sessions, workspaces }) {
+			const [scope, setScope] = (0, react.useState)("enum");
+			const [range, setRange] = (0, react.useState)("3");
+			const [sessionIds, setSessionIds] = (0, react.useState)([]);
+			const [manualIds, setManualIds] = (0, react.useState)("");
+			const [pickerOpen, setPickerOpen] = (0, react.useState)(false);
+			const [query, setQuery] = (0, react.useState)("");
 			const [message, setMessage] = (0, react.useState)("");
-			const deliver = async (copyOnly) => {
-				const text = buildTrigger(kind);
-				if (!copyOnly && sendToAgent) {
-					const reason = sendToAgent(text);
-					if (!reason) {
-						setMessage("触发指令已填入当前对话输入框：查看后按回车发送，Agent 会用 wiki-collect 采集并直接入库。");
-						return;
+			const [initialized, setInitialized] = (0, react.useState)(null);
+			const [vaultRoot, setVaultRoot] = (0, react.useState)(null);
+			const [sessionOptions, setSessionOptions] = (0, react.useState)([]);
+			const [checkpoints, setCheckpoints] = (0, react.useState)([]);
+			const [cpOpen, setCpOpen] = (0, react.useState)(false);
+			(0, react.useEffect)(() => {
+				let alive = true;
+				const refresh = () => {
+					fetchVaults().then((r) => {
+						if (!alive) return;
+						setVaultRoot(r.current?.root ?? null);
+						setInitialized(r.vaults.find((v) => v.id === r.current?.id)?.initialized ?? true);
+					}).catch(() => {
+						if (alive) setInitialized(null);
+					});
+					fetchCheckpoints().then((cs) => {
+						if (alive) setCheckpoints(cs);
+					}).catch(() => {});
+				};
+				refresh();
+				const onFocus = () => refresh();
+				const onVaultChanged = () => {
+					setSessionIds([]);
+					setManualIds("");
+					refresh();
+				};
+				window.addEventListener("wiki:pages-changed", refresh);
+				window.addEventListener("wiki:vault-changed", onVaultChanged);
+				window.addEventListener("focus", onFocus);
+				return () => {
+					alive = false;
+					window.removeEventListener("wiki:pages-changed", refresh);
+					window.removeEventListener("wiki:vault-changed", onVaultChanged);
+					window.removeEventListener("focus", onFocus);
+				};
+			}, []);
+			(0, react.useEffect)(() => {
+				let alive = true;
+				const read = () => {
+					try {
+						const snap = sessions?.list.getSnapshot();
+						const byId = snap?.byId ?? {};
+						const items = snap?.items?.length ? snap.items.map((s) => ({
+							id: s.id,
+							title: s.title,
+							cwd: byId[s.id]?.cwd
+						})) : Object.entries(byId).map(([id, v]) => ({
+							id,
+							title: v.title,
+							cwd: v.cwd
+						}));
+						if (alive) setSessionOptions(items);
+					} catch {
+						if (alive) setSessionOptions([]);
 					}
-					setMessage(`无法自动预填输入框（${reason}）：触发指令已复制到剪贴板，请粘贴到对话发送给 Agent。`);
+				};
+				read();
+				const onFocus = () => read();
+				const onChanged = () => read();
+				window.addEventListener("focus", onFocus);
+				window.addEventListener("wiki:pages-changed", onChanged);
+				return () => {
+					alive = false;
+					window.removeEventListener("focus", onFocus);
+					window.removeEventListener("wiki:pages-changed", onChanged);
+				};
+			}, [sessions]);
+			/** 当前库根对应的工作区（path 归一化匹配；工作区 id 字段名以 workspaceId 为准）。 */
+			const workspace = (0, react.useMemo)(() => {
+				if (!vaultRoot) return void 0;
+				try {
+					const items = workspaces?.list.getSnapshot()?.items ?? [];
+					const want = normPath(vaultRoot);
+					return items.find((w) => normPath(w.path) === want);
+				} catch {
+					return;
+				}
+			}, [
+				vaultRoot,
+				workspaces,
+				sessionOptions
+			]);
+			/** 只保留当前工作区的会话：优先用工作区 sessionIds 归属账；退化用 cwd 前缀匹配。 */
+			const scopedSessions = (0, react.useMemo)(() => {
+				if (!vaultRoot) return {
+					items: sessionOptions,
+					scoped: false
+				};
+				const owned = new Set(workspace?.sessionIds ?? []);
+				if (owned.size > 0) return {
+					items: sessionOptions.filter((s) => owned.has(s.id)),
+					scoped: true
+				};
+				const root = normPath(vaultRoot);
+				const byCwd = sessionOptions.filter((s) => s.cwd && normPath(s.cwd).startsWith(root));
+				if (byCwd.length > 0) return {
+					items: byCwd,
+					scoped: true
+				};
+				return {
+					items: sessionOptions,
+					scoped: false
+				};
+			}, [
+				sessionOptions,
+				workspace,
+				vaultRoot
+			]);
+			const filtered = (0, react.useMemo)(() => {
+				const q = query.trim().toLowerCase();
+				if (!q) return scopedSessions.items;
+				return scopedSessions.items.filter((s) => s.id.toLowerCase().includes(q) || (s.title ?? "").toLowerCase().includes(q));
+			}, [scopedSessions, query]);
+			const shown = filtered.slice(0, MAX_RENDERED_SESSIONS);
+			const effectiveIds = (0, react.useMemo)(() => [.../* @__PURE__ */ new Set([...sessionIds, ...parseManualIds(manualIds)])], [sessionIds, manualIds]);
+			/** 允许建会话的唯一条件：库根已知**且库已初始化**（injection 见下方 guard）。
+			*  库根未知或未初始化时宁可不建会话——未初始化库上入库会隐式 ensure 建库，
+			*  与「注册 ≠ 初始化」契约冲突（初始化是显式的 wiki_init 动作）。 */
+			const canStartSession = Boolean(vaultRoot) && initialized !== false;
+			const send = async (text, okText) => {
+				if (!vaultRoot) {
+					setMessage("未能确定当前库根目录（/vaults 读取失败）：请点刷新后重试，或改用「复制触发指令」。");
+					return;
+				}
+				if (initialized === false) {
+					setMessage("当前库尚未初始化（磁盘上没有 .wiki）：请先点上面的「初始化知识库」，建好后再蒸馏；也可「复制触发指令」自行处理。");
+					return;
+				}
+				const res = startAgentSession ? await startAgentSession(text, vaultRoot) : {
+					ok: false,
+					message: "宿主未提供新建会话能力"
+				};
+				if (!res.ok) {
 					try {
 						await navigator.clipboard.writeText(text);
 					} catch {}
+					setMessage(`无法新建会话（${res.message ?? "未知原因"}）：触发指令已复制到剪贴板，请粘贴到对话发送给 Agent。`);
 					return;
 				}
-				try {
-					await navigator.clipboard.writeText(text);
-				} catch {}
-				setMessage("触发指令已复制到剪贴板，请粘贴到对话发送给 Agent（当前对话框无法自动预填）。");
+				setMessage(res.message ? `${okText}（注意：${res.message}）` : okText);
+			};
+			const initVault = async () => {
+				const text = [
+					"请初始化当前工作区的知识库：调用 wiki_init 工具创建 .wiki 脚手架",
+					"（index.md / .manifest.json / concepts、entities、references、synthesis、projects、dictionaries、tables 目录）。",
+					"完成后报告：库根路径、是否新建、当前页数。不要在此步骤采集或写入知识页。"
+				].join("");
+				await send(text, "已新建会话并预填初始化指令：切到该新会话后回车发送，Agent 会用 wiki_init 建库，建好后回来看板蒸馏");
+			};
+			const toggleSession = (id) => {
+				setSessionIds((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+			};
+			const deliver = async (copyOnly) => {
+				if (scope === "both") {
+					setMessage(RESERVED_NOTICE);
+					return;
+				}
+				let text;
+				if (scope === "sessions") text = effectiveIds.length > 0 ? buildSelectedSessionsTrigger(effectiveIds, vaultRoot) : buildDistillTrigger(range, vaultRoot);
+				else text = buildCollectTrigger(scope);
+				if (copyOnly) {
+					try {
+						await navigator.clipboard.writeText(text);
+					} catch {}
+					setMessage("触发指令已复制到剪贴板，请粘贴到对话发送给 Agent（未创建新会话）。");
+					return;
+				}
+				await send(text, scope === "sessions" ? "已新建会话并预填指令：切到该新会话后回车发送，Agent 会用 wiki-distill 蒸馏并入库。" : "已新建会话并预填指令：切到该新会话后回车发送，Agent 会用 wiki-collect 采集并直接入库。");
 			};
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: "knj-vcol",
@@ -5611,18 +6022,61 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						className: "knj-banner knj-banner--info",
 						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [
-							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: "代码结构采集" }),
-							"：把当前工作区的枚举/常量字典与表结构采集进知识库。 点击后把触发指令交给当前对话 Agent，由它用内置 ",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: "知识蒸馏" }),
+							"：把当前工作区的代码结构或会话沉淀成知识页。 选择范围后点击，触发指令会交给当前对话 Agent——代码结构走 ",
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: "wiki-collect" }),
-							" skill 完成 扫描 → 联动存量对账 → 蒸馏 → 直接入库（按你的决策不做二次确认；知识库纳入 git 分支合并把关已预留）。 本视图不产生草稿状态，也不直接写库。"
+							" skill， 会话蒸馏走 ",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: "wiki-distill" }),
+							" skill，两者都经 ",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: "wiki_ingest" }),
+							" 入库。 本视图不产生草稿状态，也不直接写库。"
 						] })
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: "knj-pop__hint",
 						children: [
-							"支持：Java enum、Java public static final、SQL DDL、MyBatis XML、JPA Entity。",
+							"代码侧支持：Java enum、Java public static final、SQL DDL、MyBatis XML、JPA Entity； 不支持：TypeScript、Python、Go、任意 ORM、JSON Schema。",
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("br", {}),
-							"不支持：TypeScript、Python、Go、任意 ORM、JSON Schema。只读代码文件，不读会话归档。"
+							"会话侧：原始归档只写入 ",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: "<vault>/_system/dsh-sessions/" }),
+							"，不读取其他工作区会话、不参与知识检索。"
+						]
+					}),
+					initialized === false && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "knj-banner knj-banner--warn",
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "knj-vcol",
+							style: { gap: 6 },
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: "当前库尚未初始化" }),
+								"：磁盘上还没有 ",
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: ".wiki" }),
+								"，蒸馏结果无处入库。"
+							] }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "knj-pop__row",
+								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "knj-btn knj-btn--primary",
+									onClick: initVault,
+									children: "初始化知识库"
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+									className: "knj-pop__hint",
+									children: "把初始化指令交给当前对话 Agent（调用 wiki_init），建好后回来蒸馏。"
+								})]
+							})]
+						})
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "knj-pop__hint",
+						children: [
+							"当前知识库与工作区一一对应：",
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: workspace?.title?.trim() || vaultRoot || "(未确定)" }),
+							workspace ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [" · 工作区 ", (workspace.workspaceId ?? workspace.id ?? "").slice(0, 8)] }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: "（未匹配到工作区，请刷新）" }),
+							vaultRoot ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("br", {}),
+								"库根：",
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: vaultRoot })
+							] }) : null
 						]
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
@@ -5634,44 +6088,283 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 								className: "knj-hrow",
 								style: { gap: 7 },
-								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-									type: "radio",
-									name: "collect-kind",
-									checked: kind === s.value,
-									onChange: () => setKind(s.value)
-								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-									style: { fontWeight: 500 },
-									children: s.label
-								})]
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+										type: "radio",
+										name: "distill-scope",
+										checked: scope === s.value,
+										onChange: () => setScope(s.value)
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										style: { fontWeight: 500 },
+										children: s.label
+									}),
+									s.reserved && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "knj-chip knj-chip--neutral",
+										title: "待接入：3 个 skill 组合",
+										children: "预留"
+									})
+								]
 							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 								className: "knj-pop__hint",
 								children: s.detail
 							})]
 						}, s.value))
 					}),
+					scope === "both" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "knj-banner knj-banner--warn",
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: "预留，暂不可用" }),
+							"：",
+							RESERVED_NOTICE
+						] })
+					}),
+					scope === "sessions" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "knj-pop__row",
+						style: { flexWrap: "wrap" },
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "knj-pop__hint",
+								children: "时间范围："
+							}),
+							RANGE_LABELS.map((r) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: `knj-btn knj-btn--sm${range === r.value && effectiveIds.length === 0 ? " knj-btn--primary" : " knj-btn--subtle"}`,
+								onClick: () => setRange(r.value),
+								children: r.label
+							}, r.value)),
+							effectiveIds.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "knj-pop__hint",
+								children: [
+									"（已勾选 ",
+									effectiveIds.length,
+									" 个会话 → 忽略时间范围，只蒸所选；清空勾选即回到按时间范围）"
+								]
+							})
+						]
+					}),
+					scope === "sessions" && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "knj-vcol",
+						style: { gap: 6 },
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "knj-pop__row",
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: "knj-btn knj-btn--sm knj-btn--subtle",
+										onClick: () => setPickerOpen((v) => !v),
+										children: pickerOpen ? "收起会话列表" : "只蒸馏指定会话（可选）"
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										className: "knj-pop__hint",
+										children: [
+											"已选 ",
+											effectiveIds.length,
+											" 个 · ",
+											scopedSessions.scoped ? `本工作区 ${scopedSessions.items.length} 个会话` : `共 ${sessionOptions.length} 个会话（未按工作区收敛）`
+										]
+									}),
+									(sessionIds.length > 0 || manualIds.trim()) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: "knj-btn knj-btn--sm",
+										onClick: () => {
+											setSessionIds([]);
+											setManualIds("");
+										},
+										children: "清空"
+									})
+								]
+							}),
+							effectiveIds.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "knj-pop__hint",
+								style: { wordBreak: "break-all" },
+								children: ["已选：", effectiveIds.join("、")]
+							}),
+							pickerOpen && scopedSessions.scoped === false && sessionOptions.length > 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "knj-banner knj-banner--warn",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", { children: [
+									"未能在宿主工作区里匹配到本库根目录，下面列出的是",
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: "全部会话" }),
+									"（可能含其它工作区）。 请只勾选确属本知识库的会话——工作区与知识库是一一对应的。"
+								] })
+							}),
+							pickerOpen && (scopedSessions.items.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "knj-pop__hint",
+								children: sessionOptions.length === 0 ? "宿主未提供会话列表：在下面直接粘贴 session id（逗号分隔可多个）。" : `当前工作区没有会话（宿主共 ${sessionOptions.length} 个会话，均不属于本工作区）；可粘贴 session id，但应确属本知识库。`
+							}) : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									className: "knj-input",
+									value: query,
+									onChange: (e) => setQuery(e.target.value),
+									placeholder: `搜索会话（标题或 id，本工作区 ${scopedSessions.items.length} 个）`,
+									spellCheck: false
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "knj-pop__row",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+										type: "button",
+										className: "knj-btn knj-btn--sm knj-btn--subtle",
+										onClick: () => setSessionIds((prev) => [.../* @__PURE__ */ new Set([...prev, ...shown.map((s) => s.id)])]),
+										children: "全选当前结果"
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+										className: "knj-pop__hint",
+										children: [
+											"显示 ",
+											shown.length,
+											"/",
+											filtered.length,
+											filtered.length > MAX_RENDERED_SESSIONS ? "（可搜索缩小范围）" : ""
+										]
+									})]
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									style: {
+										maxHeight: 200,
+										overflowY: "auto",
+										border: "1px solid var(--knj-border-soft)",
+										borderRadius: 8,
+										padding: 4
+									},
+									children: [shown.map((s) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+										className: "knj-result-item",
+										style: { cursor: "pointer" },
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											className: "knj-hrow",
+											style: { gap: 7 },
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+												type: "checkbox",
+												checked: sessionIds.includes(s.id),
+												onChange: () => toggleSession(s.id)
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: { fontWeight: 500 },
+												children: s.title?.trim() || "(无标题会话)"
+											})]
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "knj-pop__hint",
+											children: s.id
+										})]
+									}, s.id)), shown.length === 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "knj-pop__hint",
+										children: "没有匹配的会话，换个关键词试试。"
+									})]
+								})
+							] })),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								className: "knj-input",
+								value: manualIds,
+								onChange: (e) => setManualIds(e.target.value),
+								placeholder: "也可粘贴 session id（逗号分隔多个）",
+								spellCheck: false
+							})
+						]
+					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: "knj-pop__row",
 						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 							type: "button",
 							className: "knj-btn knj-btn--primary",
+							disabled: scope === "both" || !canStartSession,
+							title: scope === "both" ? RESERVED_NOTICE : !canStartSession ? "当前库尚未初始化：请先点「初始化知识库」" : void 0,
 							onClick: () => deliver(false),
-							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconSparkles, { size: 14 }), "预填当前对话开始采集"]
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconSparkles, { size: 14 }), "新建会话并预填"]
 						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 							type: "button",
 							className: "knj-btn knj-btn--subtle",
+							disabled: scope === "both",
+							title: scope === "both" ? RESERVED_NOTICE : void 0,
 							onClick: () => deliver(true),
 							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconCopy, { size: 14 }), "复制触发指令"]
 						})]
 					}),
-					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: "knj-pop__hint",
-						children: "触发指令会写入对话输入框（可见可编辑），你确认后回车即发送给 Agent。"
+						children: ["会新建一个会话（cwd = 当前库根目录）并把触发指令预填进它的输入框，你切过去按回车即发送给 Agent。", !canStartSession && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("br", {}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: "当前库未初始化" }),
+							"：先用上方「初始化知识库」，或改用「复制触发指令」自行处理。"
+						] })]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "knj-vcol",
+						style: { gap: 4 },
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "knj-pop__row",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+								type: "button",
+								className: "knj-btn knj-btn--sm knj-btn--subtle",
+								onClick: () => setCpOpen((v) => !v),
+								children: ["还原点", checkpoints.length > 0 ? `（${checkpoints.length}）` : ""]
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "knj-pop__hint",
+								children: "批次入库前 Agent 会自动创建；质量不佳时可在此回滚（默认保留快照之后的新页）"
+							})]
+						}), cpOpen && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							style: {
+								maxHeight: 160,
+								overflowY: "auto",
+								border: "1px solid var(--knj-border-soft)",
+								borderRadius: 8,
+								padding: 4
+							},
+							children: [checkpoints.length === 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "knj-pop__hint",
+								children: "还没有还原点。蒸馏指令会要求 Agent 入库前先调用 wiki_checkpoint。"
+							}), checkpoints.map((cp) => {
+								const doRestore = async (mode) => {
+									const question = mode === "merge" ? `回滚到还原点 ${cp.id}？\n只撤销该快照内页面的改动（批次改坏的恢复原样），快照之后新增的页面会保留。` : `精确回滚到还原点 ${cp.id}？\n整库回到该快照：快照之后新增的页面会被删除（可能是其它会话的正当产物）。`;
+									if (!window.confirm(question)) return;
+									try {
+										const r = await restoreCheckpoint(cp.id, mode);
+										setMessage(mode === "merge" ? `已回滚到 ${cp.id}：恢复 ${r.restored} 页，保留快照后新页 ${r.keptNewer} 页（现 ${r.pageCount} 页），索引已重建` : `已精确回滚到 ${cp.id}（现 ${r.pageCount} 页，快照后新增页已删除），索引已重建`);
+										window.dispatchEvent(new CustomEvent("wiki:pages-changed"));
+									} catch (e) {
+										setMessage(`回滚失败：${e instanceof Error ? e.message : String(e)}`);
+									}
+								};
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "knj-result-item",
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											className: "knj-hrow",
+											style: { gap: 7 },
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												style: { fontWeight: 500 },
+												children: cp.id
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+												className: "knj-pop__hint",
+												children: [cp.pageCount, " 页"]
+											})]
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "knj-pop__hint",
+											children: cp.createdAt
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+											className: "knj-pop__row",
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												className: "knj-btn knj-btn--sm knj-btn--ghost-danger",
+												onClick: () => doRestore("merge"),
+												children: "回滚（保留新页）"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												className: "knj-btn knj-btn--sm",
+												onClick: () => doRestore("exact"),
+												children: "精确回滚（删新页）"
+											})]
+										})
+									]
+								}, cp.id);
+							})]
+						})]
 					}),
 					message && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						className: "knj-banner knj-banner--info",
 						style: { color: "var(--knj-text)" },
 						children: message
-					})
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(SemanticIndexPanel, {})
 				]
 			});
 		}
@@ -5683,12 +6376,16 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 		* - 切换/变更后回调 onVaultChanged，由上层刷新树/lint/图谱
 		* 样式全部走宿主令牌（styles.ts），随宿主浅/深主题自适应。
 		*/
+		/** 取工作区 id：兼容 workspaceId（现行契约）与 id（旧版/窄化面）。 */
+		function workspaceIdOf(w) {
+			return w?.workspaceId ?? w?.id;
+		}
 		const SOURCE_LABEL = {
 			cwd: "默认",
 			workspace: "工作区",
 			attached: "挂接"
 		};
-		function VaultHeader({ workspaces, sessions, onVaultChanged }) {
+		function VaultHeader({ workspaces, sessions, startAgentSession, onVaultChanged }) {
 			const [current, setCurrent] = (0, react.useState)(null);
 			const [vaults, setVaults] = (0, react.useState)([]);
 			const [notice, setNotice] = (0, react.useState)(null);
@@ -5697,7 +6394,6 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 			const [formName, setFormName] = (0, react.useState)("");
 			const [busy, setBusy] = (0, react.useState)(false);
 			const activatedRootRef = (0, react.useRef)(null);
-			const [diag, setDiag] = (0, react.useState)("");
 			const flash = (text, kind = "ok") => {
 				setNotice({
 					text,
@@ -5722,14 +6418,11 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 					try {
 						const wsSnap = workspaces.list.getSnapshot();
 						let ssSnap;
-						let ssErr = "";
 						try {
 							ssSnap = sessions?.list.getSnapshot();
-						} catch (e) {
-							ssErr = String(e);
+						} catch {
+							ssSnap = void 0;
 						}
-						const sessCount = ssSnap?.byId ? Object.keys(ssSnap.byId).length : -1;
-						setDiag(`ws#${(wsSnap.items ?? []).length} ${String(wsSnap.state)}/${String(wsSnap.phase)} | ss=${sessions ? "ok" : "NO"}${ssErr ? `(err ${ssErr.slice(0, 30)})` : ""} ssP=${String(ssSnap?.phase)}/${String(ssSnap?.state)} cur=${ssSnap?.current ? ssSnap.current.slice(0, 12) : "∅"} sess#${sessCount} ready=${wsSnap.baselinesReady ? "y" : "n"} recent=${(wsSnap.recentWorkspaceId ?? "∅").slice(0, 8)}`);
 						if (disposed) return;
 						if (!(wsSnap.baselinesReady || wsSnap.phase === "ready")) return;
 						let targetRoot;
@@ -5742,8 +6435,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 								if (cwd) targetRoot = cwd;
 							}
 						}
-						targetRoot ??= ((wsSnap.items ?? []).find((w) => w.id === wsSnap.recentWorkspaceId) ?? wsSnap.items?.[0])?.path;
-						setDiag((prev) => `${prev} → target=${targetRoot ? targetRoot.split(/[\\/]/).pop() : "∅"}`);
+						targetRoot ??= ((wsSnap.items ?? []).find((w) => workspaceIdOf(w) === wsSnap.recentWorkspaceId) ?? wsSnap.items?.[0])?.path;
 						if (!targetRoot || disposed || activatedRootRef.current === targetRoot) return;
 						activatedRootRef.current = targetRoot;
 						activateVault(targetRoot).then((r) => {
@@ -5753,7 +6445,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 							onVaultChanged();
 						}).catch(() => {});
 					} catch (e) {
-						setDiag(`step err: ${String(e).slice(0, 80)}`);
+						console.warn("[knj] vault follow step failed:", String(e));
 					}
 				};
 				step();
@@ -5803,6 +6495,30 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 					setBusy(false);
 				}
 			};
+			/** v11：库未初始化（磁盘无 .wiki）时，新建会话让 Agent 初始化（可见、可打断）。 */
+			const initInstruction = () => [
+				"请初始化当前工作区的知识库：调用 wiki_init 工具创建 .wiki 脚手架",
+				"（index.md / .manifest.json / concepts、entities、references、synthesis、projects、dictionaries、tables 目录）。",
+				"完成后报告：库根路径、是否新建、当前页数。不要在此步骤采集或写入知识页。"
+			].join("");
+			const doInit = async () => {
+				const text = initInstruction();
+				const res = startAgentSession ? await startAgentSession(text, current?.root) : {
+					ok: false,
+					message: "宿主未提供新建会话能力"
+				};
+				if (!res.ok) {
+					try {
+						await navigator.clipboard.writeText(text);
+					} catch {}
+					flash(`无法新建会话（${res.message ?? "未知原因"}）：初始化指令已复制，请粘贴到对话发送给 Agent`, "err");
+					return;
+				}
+				flash(res.message ? `已新建会话并预填初始化指令，但请注意：${res.message}` : "已新建会话并预填初始化指令：切到该新会话后回车发送，Agent 会用 wiki_init 建库");
+				setTimeout(() => {
+					load().catch(() => {});
+				}, 4e3);
+			};
 			const doRemove = async () => {
 				if (!current || current.source !== "attached") return;
 				if (!window.confirm(`从列表中移除知识库「${current.name}」？\n不会删除磁盘上的任何文件。`)) return;
@@ -5839,6 +6555,28 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 								children: current.root
 							}),
 							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { className: "knj-statusbar__spacer" }),
+							current && !(vaults.find((v) => v.id === current.id)?.initialized ?? true) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "knj-btn knj-btn--sm knj-btn--primary",
+								disabled: busy,
+								title: `此工作区还没有 .wiki，点此把初始化交给当前对话 Agent（wiki_init）`,
+								onClick: doInit,
+								children: "初始化知识库"
+							}),
+							current && !(vaults.find((v) => v.id === current.id)?.initialized ?? true) && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "knj-chip knj-chip--neutral",
+								title: "磁盘上还没有 .wiki：注册 ≠ 建库",
+								children: "未初始化"
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "knj-icon-btn",
+								title: "刷新库列表",
+								onClick: () => {
+									load().catch(() => {});
+								},
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconRefresh, { size: 14 })
+							}),
 							current?.source === "attached" && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 								type: "button",
 								className: "knj-icon-btn knj-icon-btn--danger",
@@ -5854,17 +6592,6 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 								children: manageOpen ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconChevronDown, { size: 14 }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconGear, { size: 14 })
 							})
 						]
-					}),
-					diag && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-						className: "knj-diag",
-						style: {
-							fontSize: 11,
-							lineHeight: 1.4,
-							color: "var(--knj-text-3, #888)",
-							wordBreak: "break-all",
-							margin: "2px 0 4px"
-						},
-						children: diag
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
 						className: "knj-select knj-vault__select",
@@ -5944,7 +6671,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 		* - 浏览/图谱分段切换；内容区随搜索结果 / 树 / 图谱切换
 		* - 底部状态条（LintPanel）：页数 + 健康度；「问题」「工具」面板展开
 		*/
-		function WikiSidebar({ openNote, workspaces, sessions, sendToAgent }) {
+		function WikiSidebar({ openNote, workspaces, sessions, startAgentSession }) {
 			const [results, setResults] = (0, react.useState)(null);
 			const [view, setView] = (0, react.useState)("browse");
 			const [vaultVersion, setVaultVersion] = (0, react.useState)(0);
@@ -5960,6 +6687,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(VaultHeader, {
 						workspaces,
 						sessions,
+						startAgentSession,
 						onVaultChanged: handleVaultChanged
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(SearchBox, { onResult: setResults }),
@@ -5983,15 +6711,20 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 									type: "button",
 									className: `knj-seg__item${view === "collect" ? " knj-seg__item--active" : ""}`,
+									title: "代码结构采集 / 近期会话蒸馏",
 									onClick: () => setView("collect"),
-									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconImport, { size: 13 }), "代码采集"]
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconSparkles, { size: 13 }), "知识蒸馏"]
 								})
 							]
 						})
 					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 						className: "knj-grow knj-scroll",
-						children: view === "graph" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(GraphView, { onOpenNote: openNote }) }, vaultVersion) : view === "collect" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CodeCollectLauncher, { sendToAgent }) : results !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						children: view === "graph" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(GraphView, { onOpenNote: openNote }) }, vaultVersion) : view === "collect" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(KnowledgeDistillLauncher, {
+							startAgentSession,
+							sessions,
+							workspaces
+						}) : results !== null ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 							className: "knj-vcol",
 							children: [
 								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
@@ -6729,63 +7462,225 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 				const sessions = hostService(ctx, "sessions");
 				hostService(ctx, "conversation");
 				/**
-				* v9：把受限指令交给「当前对话」的 Agent——填入该会话 composer 输入框（可见可编辑，
-				* 用户回车即发送，无隐藏 Agent）。返回 ''=成功；非空=失败原因（UI 显示并退回复制）。
-				* 调用序列镜像宿主 better-sidebar 规范（client.js:13344）：
-				*   actx = sessions.scope(id) → conversation = ctx.get('conversation')
-				*   → input = conversation.input.for(actx) → input.state.getSnapshot() → input.setDraft(text)
+				* v11：把受限指令交给 Agent —— **新建一个会话**并预填指令（可见可编辑，用户回车发送）。
+				* 返回 { ok:false, message } = 失败原因（UI 显示并退回复制）；ok:true 可带告警 message。
+				* 宿主契约（dsh-api-session-controller client ISessions）：
+				*   await sessions.create({ workspaceId, cwd }) → newId → sessions.open(newId)
+				*   → 轮询 sessions.scope(newId) → conversation.input.for(actx)
+				*   → input.state.getSnapshot()（物化输入态）→ input.setDraft(text) → 读回校验
+				* 归属：先按库根从 workspaces 快照匹配 workspaceId 一并传入（只传 cwd 时宿主可能按“当前工作区”处理），
+				* 创建后再从会话列表读回 cwd 校验，不一致时如实告警而不是假装成功。
 				*/
-				const sendToAgent = (text) => {
+				const normalizePath = (p) => (p ?? "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+				const matchWorkspaceId = (root) => {
+					if (!root) return void 0;
+					try {
+						const snap = workspaces?.list.getSnapshot();
+						const want = normalizePath(root);
+						const hit = snap?.items?.find((w) => normalizePath(typeof w.path === "string" ? w.path : void 0) === want);
+						if (!hit) return void 0;
+						const id = typeof hit.workspaceId === "string" && hit.workspaceId || typeof hit.id === "string" && hit.id || "";
+						if (!id) {
+							console.warn("[knj] workspace matched but has no id field; keys=", Object.keys(hit));
+							return;
+						}
+						return {
+							id,
+							title: typeof hit.title === "string" ? hit.title : void 0
+						};
+					} catch {
+						return;
+					}
+				};
+				const readSessionCwd = (id) => {
+					try {
+						const snap = sessions?.list.getSnapshot();
+						return snap?.byId?.[id]?.cwd ?? snap?.items?.find((s) => s.id === id)?.cwd;
+					} catch {
+						return;
+					}
+				};
+				/**
+				* 解析当前库根对应的工作区 id：
+				* 1) 先在工作区快照里按归一化路径匹配（可能需要等基线就绪，最多 ~2s）
+				* 2) 匹配不到就调 workspaces.create({ path }) 把库根注册成工作区（幂等）
+				* 都失败则返回 undefined（调用方据此只按 cwd 建会话并如实告警）。
+				*/
+				const ensureWorkspaceId = async (root) => {
+					if (!root) return void 0;
+					normalizePath(root);
+					for (let i = 0; i < 20; i++) {
+						const hit = matchWorkspaceId(root);
+						if (hit) return {
+							id: hit.id,
+							via: "matched"
+						};
+						if ((() => {
+							try {
+								const snap = workspaces?.list.getSnapshot();
+								return Boolean(snap?.baselinesReady) || snap?.phase === "ready";
+							} catch {
+								return false;
+							}
+						})()) break;
+						await new Promise((r) => setTimeout(r, 100));
+					}
+					try {
+						const created = await workspaces?.create?.({ path: root });
+						const createdId = created ? created.workspaceId ?? created.id : void 0;
+						if (typeof createdId === "string" && createdId) {
+							console.info("[knj] workspace registered for vault root", {
+								root,
+								workspaceId: createdId
+							});
+							return {
+								id: createdId,
+								via: "created"
+							};
+						}
+					} catch (e) {
+						console.warn("[knj] workspaces.create failed:", String(e));
+					}
+				};
+				/** 读回新会话实际归属的工作区 id（工作区快照的 sessionIds 归属账；字段名 workspaceId/id 兼容）。 */
+				const readSessionWorkspaceId = (id) => {
+					try {
+						const hit = (workspaces?.list.getSnapshot())?.items?.find((w) => Array.isArray(w.sessionIds) && w.sessionIds.includes(id));
+						if (!hit) return void 0;
+						return typeof hit.workspaceId === "string" && hit.workspaceId || typeof hit.id === "string" && hit.id || void 0;
+					} catch {
+						return;
+					}
+				};
+				const startAgentSession = async (text, cwd) => {
 					const fail = (reason) => {
-						console.warn("[knj] sendToAgent failed:", reason);
-						return reason;
+						console.warn("[knj] startAgentSession failed:", reason);
+						return {
+							ok: false,
+							message: reason
+						};
 					};
 					try {
 						if (!text) return fail("empty instruction");
-						let snap;
-						try {
-							snap = sessions?.list.getSnapshot();
-						} catch (e) {
-							return fail(`sessions.list.getSnapshot threw: ${String(e)}`);
-						}
 						if (!sessions) return fail("host service \"sessions\" unavailable");
-						if (!snap) return fail("sessions.list snapshot empty");
-						const current = typeof snap.current === "string" && snap.current ? snap.current : snap.items?.[0]?.id;
-						if (!current) return fail("no current session id in snapshot");
-						let actx;
+						if (typeof sessions.create !== "function") return fail("sessions.create unavailable (host too old)");
+						const workspace = await ensureWorkspaceId(cwd);
+						let newId;
 						try {
-							actx = sessions.scope?.(current);
+							newId = await sessions.create(workspace ? {
+								workspaceId: workspace.id,
+								cwd
+							} : cwd ? { cwd } : {});
 						} catch (e) {
-							return fail(`sessions.scope(${current}) threw: ${String(e)}`);
+							return fail(`sessions.create threw: ${String(e)}`);
 						}
-						if (actx === void 0 || actx === null) return fail(`sessions.scope("${current}") returned nothing`);
-						let conversation;
+						if (!newId) return fail("sessions.create returned no id");
 						try {
-							conversation = typeof ctx.get === "function" ? ctx.get("conversation") : void 0;
+							sessions.open?.(newId);
 						} catch (e) {
-							return fail(`ctx.get('conversation') threw: ${String(e)}`);
+							return fail(`sessions.open threw: ${String(e)}`);
 						}
-						if (!conversation) return fail("host service \"conversation\" unavailable via ctx.get");
-						let input;
 						try {
-							input = conversation.input?.for?.(actx);
-						} catch (e) {
-							return fail(`conversation.input.for threw: ${String(e)}`);
+							await sessions.refresh?.();
+						} catch {}
+						let mismatch = "";
+						if (cwd) {
+							const actualWs = readSessionWorkspaceId(newId);
+							const actualCwd = readSessionCwd(newId);
+							if (workspace && actualWs && actualWs !== workspace.id) mismatch = `新会话工作区可能不对：期望工作区 ${workspace.id}，实际挂在 ${actualWs}`;
+							else if (workspace && !actualWs) mismatch = `新会话暂未出现在目标工作区（${workspace.id}）的会话列表下，请确认左侧工作区`;
+							else if (!workspace && actualCwd && normalizePath(actualCwd) !== normalizePath(cwd)) mismatch = `新会话工作区可能不对：期望 ${cwd}，实际 ${actualCwd}（未能把库根注册成工作区）`;
+							else if (!workspace) mismatch = `未能把 ${cwd} 注册/匹配成工作区，已按 cwd 创建新会话，请确认左侧工作区`;
 						}
-						if (!input) return fail("conversation.input.for(scope) returned nothing");
-						try {
-							input.state?.getSnapshot?.();
-						} catch (e) {
-							return fail(`input.state.getSnapshot threw: ${String(e)}`);
+						const marker = text.slice(0, 12);
+						let lastErr = "";
+						let draftSeen = "";
+						let conversationCache;
+						for (let i = 0; i < 40; i++) {
+							let actx;
+							try {
+								actx = sessions.scope?.(newId);
+							} catch (e) {
+								lastErr = `sessions.scope threw: ${String(e)}`;
+							}
+							if (actx === void 0 || actx === null) {
+								lastErr = lastErr || `sessions.scope("${newId}") not available yet`;
+								await new Promise((r) => setTimeout(r, 150));
+								continue;
+							}
+							if (!conversationCache) {
+								try {
+									conversationCache = typeof ctx.get === "function" ? ctx.get("conversation") : void 0;
+								} catch (e) {
+									lastErr = `ctx.get('conversation') threw: ${String(e)}`;
+								}
+								if (!conversationCache) {
+									lastErr = "host service \"conversation\" unavailable via ctx.get";
+									await new Promise((r) => setTimeout(r, 150));
+									continue;
+								}
+							}
+							let input;
+							try {
+								input = conversationCache.input?.for?.(actx);
+							} catch (e) {
+								lastErr = `conversation.input.for threw: ${String(e)}`;
+							}
+							if (!input) {
+								lastErr = "conversation.input.for(scope) not available yet";
+								await new Promise((r) => setTimeout(r, 150));
+								continue;
+							}
+							const setDraft = typeof input.setDraft === "function" ? input.setDraft : input.actions?.setDraft;
+							if (typeof setDraft !== "function") {
+								lastErr = "no setDraft on input face";
+								await new Promise((r) => setTimeout(r, 150));
+								continue;
+							}
+							try {
+								input.state?.getSnapshot?.();
+							} catch (e) {
+								lastErr = `input.state.getSnapshot threw: ${String(e)}`;
+							}
+							try {
+								setDraft.call(input, text);
+							} catch (e) {
+								lastErr = `setDraft threw: ${String(e)}`;
+							}
+							try {
+								const draft = input.state?.getSnapshot?.()?.draft ?? "";
+								draftSeen = draft.slice(0, 60);
+								if (draft.includes(marker)) {
+									console.info("[knj] startAgentSession: prefill verified", {
+										sessionId: newId,
+										workspaceId: workspace?.id,
+										workspaceVia: workspace?.via,
+										actualWorkspaceId: readSessionWorkspaceId(newId),
+										cwd,
+										attempt: i + 1
+									});
+									return {
+										ok: true,
+										message: mismatch || void 0
+									};
+								}
+								if (i > 0 && draft.trim() !== "") {
+									console.warn("[knj] startAgentSession: user typing detected, stop prefill retries", {
+										sessionId: newId,
+										draft: draft.slice(0, 40)
+									});
+									return {
+										ok: true,
+										message: `检测到新会话里已有你的输入，已停止自动预填（指令请用「复制触发指令」）${mismatch ? "；" + mismatch : ""}`
+									};
+								}
+								lastErr = lastErr || `draft not observed after setDraft (draft="${draftSeen}")`;
+							} catch (e) {
+								lastErr = `readback threw: ${String(e)}`;
+							}
+							await new Promise((r) => setTimeout(r, 150));
 						}
-						const setDraft = typeof input.setDraft === "function" ? input.setDraft : input.actions?.setDraft;
-						if (typeof setDraft !== "function") return fail("no setDraft on input face");
-						try {
-							setDraft.call(input, text);
-						} catch (e) {
-							return fail(`setDraft threw: ${String(e)}`);
-						}
-						return "";
+						return fail(`prefill not verified after retries (lastError=${lastErr}; draftSeen="${draftSeen}")`);
 					} catch (e) {
 						return fail(`unexpected: ${String(e)}`);
 					}
@@ -6806,7 +7701,7 @@ Please report this to https://github.com/markedjs/marked.`, e) {
 						openNote,
 						workspaces,
 						sessions,
-						sendToAgent
+						startAgentSession
 					})
 				}));
 				disposers.push(betterSidebar.registerTab({

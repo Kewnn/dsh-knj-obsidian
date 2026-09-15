@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, renameSync, rmSync } from 'node:fs'
 import { basename, join, resolve, sep } from 'node:path'
 import { vaultIdOf } from './types.ts'
-import type { WikiCategory, WikiPage, ManifestEntry, VaultManifest, VaultProvider, VaultRecord, VaultListEntry } from './types.ts'
+import type { WikiCategory, WikiPage, WikiTier, ManifestEntry, VaultManifest, VaultProvider, VaultRecord, VaultListEntry } from './types.ts'
 
 const WIKI_DIR = '.wiki'
 const MANIFEST_FILE = '.manifest.json'
@@ -25,6 +25,33 @@ export class SaveError extends Error {
   }
 }
 
+/** 合法 tier 取值（缺省 supporting）。 */
+export const TIERS: readonly WikiTier[] = ['core', 'supporting', 'peripheral']
+
+/**
+ * tier 归一化：无法识别的值（拼错、空、未来新增值）一律回退 supporting。
+ * 读取宽容——frontmatter 是用户/agent 手写的，不能因为一个错拼就让整页读不出来。
+ */
+export function normalizeTier(value: unknown): WikiTier {
+  const v = String(value ?? '').trim().toLowerCase()
+  return (TIERS as readonly string[]).includes(v) ? (v as WikiTier) : 'supporting'
+}
+
+/** 摘要规则：正文首个非空、非标题、非表格、非分隔线的行，截 60 字。
+ *  写入 frontmatter 的 `summary:` 与写 index.md 必须是同一条规则，故放在这里由
+ *  index-builder 复用（否则两个派生工件会给出不一致的摘要）。 */
+export function summarizeBody(body: string): string {
+  for (const rawLine of body.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) continue
+    if (line.startsWith('#')) continue
+    if (line.startsWith('|')) continue
+    if (line.startsWith('---')) continue
+    return [...line].slice(0, 60).join('')
+  }
+  return ''
+}
+
 /** 解析整份文件文本（统一 \n 后）为 WikiPage；无合法 frontmatter 返回 null。
  *  字段回退语义与 v4 readPage 一致（缺省用 fallbackId/fallbackCategory），读取宽容。
  *  剥离开头 UTF-8 BOM（\uFEFF）：带 BOM 的文件（Windows 编辑器常见）同样可解析。 */
@@ -33,7 +60,9 @@ export function parsePageText(raw: string, fallbackId = '', fallbackCategory: Wi
   if (!m) return null
   const fm: Record<string, string> = {}
   for (const line of m[1].split('\n')) {
-    const kv = line.match(/^([\w-]+):\s*(.+)$/)
+    // [^\n]+ 而非 (.+)：JS 的 `.` 不匹配 U+2028/U+2029，用 `.` 会让含这类字符的值整行失配、
+    // 字段被静默丢弃（文件里明明写着，读出来却没有）。这里按 \n 切行，行内已无 \n。
+    const kv = line.match(/^([\w-]+):\s*([^\n]+)$/)
     if (kv) fm[kv[1]] = kv[2]
   }
   return {
@@ -45,6 +74,10 @@ export function parsePageText(raw: string, fallbackId = '', fallbackCategory: Wi
     confidence: (fm.confidence as WikiPage['confidence']) ?? 'extracted',
     created: fm.created ?? '',
     updated: fm.updated ?? '',
+    // 读取端不派生摘要：磁盘上没有该字段就按「无摘要」处理，与外部读者（obsidian-wiki
+    // graph-query）看到的一致；派生只发生在写入端。
+    summary: fm.summary ?? '',
+    tier: normalizeTier(fm.tier),
     body: (m[2] ?? '').trim(),
   }
 }
@@ -84,13 +117,17 @@ export class VaultStore implements VaultProvider {
   }
 
   listVaults(): VaultListEntry[] {
-    return [{ ...this.currentRecord()!, pageCount: this.listPagesReadonly().length }]
+    return [{ ...this.currentRecord()!, pageCount: this.listPagesReadonly().length, initialized: existsSync(this.wikiRoot) }]
   }
 
   ensure(): void {
     mkdirSync(this.wikiRoot, { recursive: true })
     for (const c of CATEGORIES) mkdirSync(join(this.wikiRoot, c), { recursive: true })
     mkdirSync(join(this.wikiRoot, '_system', 'tools'), { recursive: true })
+    // _meta/：治理元数据（受控标签词表等）。与上游 obsidian-wiki 的 _meta/taxonomy.md 同路径，
+    // 便于将来直接复用上游 skill；上游 CLI 的 SKIP_DIRS 也已包含 _meta，不会把词表当知识页。
+    mkdirSync(join(this.wikiRoot, '_meta'), { recursive: true })
+    this.ensureObsidianIgnore()
     const indexFile = join(this.wikiRoot, 'index.md')
     if (!existsSync(indexFile)) {
       writeFileSync(indexFile, [
@@ -133,9 +170,14 @@ export class VaultStore implements VaultProvider {
     return file
   }
 
-  /** 单行化：frontmatter 值里的换行会注入伪造的 `key: value` 行（改写 id/category），写入前必须拍平。 */
+  /**
+   * 单行化：frontmatter 值里的换行会注入伪造的 `key: value` 行（改写 id/category），写入前必须拍平。
+   * 必须覆盖**全部 Unicode 行终止符**（\r \n U+2028 U+2029），不能只处理 \r\n：
+   * U+2028/U+2029 同样能截断一行，而下面的读取正则跨不过它们——只处理 \r\n 会让这类值
+   * 写得出去却读不回来（writePage 成功、readPage 的 summary 却是空串）。
+   */
   private static flatField(value: string): string {
-    return String(value ?? '').replace(/[\r\n]+/g, ' ')
+    return String(value ?? '').replace(/[\r\n\u2028\u2029]+/g, ' ')
   }
 
   writePage(page: WikiPage): { created: boolean } {
@@ -148,12 +190,27 @@ export class VaultStore implements VaultProvider {
     const safeTitle = VaultStore.flatField(page.title)
     const safeSource = VaultStore.flatField(page.source)
     const safeTags = page.tags.map((t) => VaultStore.flatField(t))
+    // 摘要取值优先级：调用方显式给出 > 沿用磁盘上已有的 > 从正文派生。
+    // 「沿用已有」是为了不毁掉人工撰写的摘要：writePage 会整份重建 frontmatter，若无条件
+    // 重派生，agent 经 wiki_ingest 重写一次就会把人工摘要换成正文首行（静默数据丢失）。
+    // 但派生摘要必须跟着正文走——若磁盘上的摘要恰好等于「上一版正文」的派生值，说明它是
+    // 机器派生的，此时才重派生（正文可能已变）。判断失手的方向是安全的：把派生误判成人工
+    // 只会留下一个略旧的摘要，而不会删掉人工内容。
+    const prior = this.readPage(page.id, page.category)
+    const priorSummary = (prior?.summary ?? '').trim()
+    const priorWasDerived = priorSummary !== '' && priorSummary === summarizeBody(prior?.body ?? '').trim()
+    const summary = VaultStore.flatField(
+      page.summary?.trim() || (priorSummary !== '' && !priorWasDerived ? priorSummary : summarizeBody(page.body)),
+    )
     const fm = [
       '---',
       `id: ${page.id}`,
       `title: ${safeTitle}`,
       `category: ${page.category}`,
       `tags: [${safeTags.join(', ')}]`,
+      // 摘要仍为空则**不写该行**：解析器要求 key 后至少有 1 个字符，写出空值行会让字段回读时消失。
+      ...(summary ? [`summary: ${summary}`] : []),
+      `tier: ${normalizeTier(page.tier)}`,
       `source: ${safeSource}`,
       `confidence: ${page.confidence}`,
       `created: ${page.created}`,
@@ -166,9 +223,42 @@ export class VaultStore implements VaultProvider {
     if (!roundTrip || roundTrip.id !== page.id || roundTrip.category !== page.category) {
       throw new Error(`frontmatter round-trip 校验失败：页面 "${page.id}" 的字段含无法安全写出的字符`)
     }
-    writeFileSync(file, text, 'utf8')
+    // 原子写（tmp + rename）：崩溃/并发下不会留下半截页面文件（与 saveRawPage 同策略）
+    const tmp = file + '.tmp-' + process.pid + '-' + Date.now()
+    writeFileSync(tmp, text, 'utf8')
+    try {
+      renameSync(tmp, file)
+    } catch (e) {
+      try { rmSync(tmp, { force: true }) } catch { /* best effort */ }
+      throw e
+    }
     this.cache.delete(this.cacheKey(page.id, page.category))
     return { created }
+  }
+
+  /**
+   * Obsidian 适配：把 .wiki 当 vault 打开时，隔离内部目录与派生工件——
+   * _system/（会话归档/进度/还原点）、_meta/（治理元数据：标签词表）、_raw/（废弃区）、
+   * wiki-export/（导出产物）、.manifest.json。
+   * 幂等 + 不覆盖用户自定义：已有 app.json 只做 userIgnoreFilters 并集合并。
+   */
+  private ensureObsidianIgnore(): void {
+    const dir = join(this.wikiRoot, '.obsidian')
+    const file = join(dir, 'app.json')
+    const REQUIRED = ['_system/', '_meta/', '_raw/', 'wiki-export/', '.manifest.json']
+    try {
+      mkdirSync(dir, { recursive: true })
+      if (existsSync(file)) {
+        const raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+        const current = Array.isArray(raw.userIgnoreFilters) ? raw.userIgnoreFilters.filter((x): x is string => typeof x === 'string') : []
+        const merged = [...current]
+        for (const f of REQUIRED) if (!merged.includes(f)) merged.push(f)
+        if (merged.length === current.length) return // 已包含全部内部忽略项：保持字节不变
+        writeFileSync(file, JSON.stringify({ ...raw, userIgnoreFilters: merged }, null, 2), 'utf8')
+        return
+      }
+      writeFileSync(file, JSON.stringify({ userIgnoreFilters: REQUIRED }, null, 2), 'utf8')
+    } catch { /* Obsidian 配置写入失败不影响库可用性 */ }
   }
 
   readPage(id: string, category: WikiCategory): WikiPage | null {
@@ -267,7 +357,26 @@ export class VaultStore implements VaultProvider {
   }
 
   private saveManifest(m: VaultManifest): void {
-    writeFileSync(this.manifestFile(), JSON.stringify(m, null, 2), 'utf8')
+    // 原子写：manifest 是增量跳过的主信号，半截 JSON 会让所有 contentHash 失效（重摄入抖动）
+    const file = this.manifestFile()
+    const tmp = file + '.tmp-' + process.pid + '-' + Date.now()
+    writeFileSync(tmp, JSON.stringify(m, null, 2), 'utf8')
+    try {
+      renameSync(tmp, file)
+    } catch (e) {
+      try { rmSync(tmp, { force: true }) } catch { /* best effort */ }
+      throw e
+    }
+  }
+
+  /**
+   * manifest 的 read-modify-write 合并写：每次写入前重读磁盘再合并本次条目，
+   * 避免跨进程（两个 DSH 进程共用同一库）互相覆盖丢失 entries。
+   */
+  updateManifestMerged(entries: Record<string, ManifestEntry>): void {
+    const m = this.loadManifest()
+    Object.assign(m.sources, entries)
+    this.saveManifest(m)
   }
 
   manifestEntry(source: string): ManifestEntry | undefined {

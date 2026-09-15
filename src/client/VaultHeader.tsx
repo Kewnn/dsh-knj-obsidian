@@ -7,7 +7,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { activateVault, attachVault, fetchVaults, removeVault, switchVault } from './api.ts'
 import type { VaultInfo, VaultListEntry } from './api.ts'
-import { IconBook, IconChevronDown, IconGear, IconPlus, IconTrash } from './icons.tsx'
+import { IconBook, IconChevronDown, IconGear, IconPlus, IconRefresh, IconTrash } from './icons.tsx'
 
 /** 客户端工作区服务的最小结构面（宿主 dsh-client-runtime 提供；缺失时仅手动切换）。 */
 export interface WorkspaceFace {
@@ -16,6 +16,8 @@ export interface WorkspaceFace {
     subscribe(cb: () => void): () => void
   }
   pickDirectory?(): Promise<string | null>
+  /** 注册已存在的路径为工作区（幂等：已注册则解析回同一工作区）；v12 用于把库根落成工作区。 */
+  create?(input: { path: string }): Promise<{ id: string; title?: string; path?: string }>
 }
 
 /** 客户端会话服务的最小结构面（宿主 dsh-client-runtime 提供）：读「当前选中会话」及其 cwd。 */
@@ -26,13 +28,27 @@ export interface SessionFace {
   }
 }
 
-interface WorkspaceView { id: string; title?: string; path?: string; sessionIds?: readonly string[] }
+interface WorkspaceView {
+  /** 宿主 dsh-api-workspace-controller 的 WorkspaceView 字段名是 workspaceId（历史/旧版可能是 id）。 */
+  workspaceId?: string
+  id?: string
+  title?: string
+  path?: string
+  sessionIds?: readonly string[]
+}
+
+/** 取工作区 id：兼容 workspaceId（现行契约）与 id（旧版/窄化面）。 */
+function workspaceIdOf(w: WorkspaceView | undefined): string | undefined {
+  return w?.workspaceId ?? w?.id
+}
 
 const SOURCE_LABEL: Record<string, string> = { cwd: '默认', workspace: '工作区', attached: '挂接' }
 
-export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
+export function VaultHeader({ workspaces, sessions, startAgentSession, onVaultChanged }: {
   workspaces?: WorkspaceFace
   sessions?: SessionFace
+  /** v11：新建会话并预填指令（ok=false 时 message 为失败原因）；用于「初始化知识库」触发 agent。 */
+  startAgentSession?: (instruction: string, cwd?: string) => Promise<{ ok: boolean; message?: string }>
   onVaultChanged: () => void
 }) {
   const [current, setCurrent] = useState<VaultInfo | null>(null)
@@ -44,8 +60,6 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
   const [busy, setBusy] = useState(false)
   // 已激活过的工作区目录（避免重复激活打转）
   const activatedRootRef = useRef<string | null>(null)
-  // 临时诊断：跟随决策依据（sessions 可用性 + current/recent/目标），定位"没跟会话走"问题
-  const [diag, setDiag] = useState('')
 
   const flash = (text: string, kind: 'ok' | 'err' = 'ok') => {
     setNotice({ text, kind })
@@ -67,15 +81,12 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
     load()
     if (!workspaces) return
     let disposed = false
-    // 诊断 + 跟随合一：轮询读快照（绕过 subscribe 是否触发的变量），每 2s 重估一次
+    // 轮询读快照（绕过 subscribe 是否触发的变量），每 2s 重估一次跟随目标
     const step = () => {
       try {
         const wsSnap = workspaces.list.getSnapshot()
         let ssSnap: { current?: string; byId?: Record<string, { cwd?: string }>; phase?: string; state?: string } | undefined
-        let ssErr = ''
-        try { ssSnap = sessions?.list.getSnapshot() } catch (e) { ssErr = String(e) }
-        const sessCount = ssSnap?.byId ? Object.keys(ssSnap.byId).length : -1
-        setDiag(`ws#${(wsSnap.items ?? []).length} ${String(wsSnap.state)}/${String(wsSnap.phase)} | ss=${sessions ? 'ok' : 'NO'}${ssErr ? `(err ${ssErr.slice(0, 30)})` : ''} ssP=${String(ssSnap?.phase)}/${String(ssSnap?.state)} cur=${ssSnap?.current ? ssSnap.current.slice(0, 12) : '∅'} sess#${sessCount} ready=${wsSnap.baselinesReady ? 'y' : 'n'} recent=${(wsSnap.recentWorkspaceId ?? '∅').slice(0, 8)}`)
+        try { ssSnap = sessions?.list.getSnapshot() } catch { ssSnap = undefined }
         if (disposed) return
         // 门禁放宽：ws 基线 ready 即跟随（不等 sessions.phase=ready——新版其语义/时序存疑）
         const wsUsable = wsSnap.baselinesReady || wsSnap.phase === 'ready'
@@ -92,8 +103,7 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
             if (cwd) targetRoot = cwd
           }
         }
-        targetRoot ??= ((wsSnap.items ?? []).find((w) => w.id === wsSnap.recentWorkspaceId) ?? wsSnap.items?.[0])?.path
-        setDiag(prev => `${prev} → target=${targetRoot ? targetRoot.split(/[\\/]/).pop() : '∅'}`)
+        targetRoot ??= ((wsSnap.items ?? []).find((w) => workspaceIdOf(w) === wsSnap.recentWorkspaceId) ?? wsSnap.items?.[0])?.path
         if (!targetRoot || disposed || activatedRootRef.current === targetRoot) return
         activatedRootRef.current = targetRoot
         activateVault(targetRoot)
@@ -105,7 +115,7 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
           })
           .catch(() => { /* 服务端不可用：保持当前库 */ })
       } catch (e) {
-        setDiag(`step err: ${String(e).slice(0, 80)}`)
+        console.warn('[knj] vault follow step failed:', String(e))
       }
     }
     step()
@@ -146,6 +156,28 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
     } finally { setBusy(false) }
   }
 
+  /** v11：库未初始化（磁盘无 .wiki）时，新建会话让 Agent 初始化（可见、可打断）。 */
+  const initInstruction = () => [
+    '请初始化当前工作区的知识库：调用 wiki_init 工具创建 .wiki 脚手架',
+    '（index.md / .manifest.json / concepts、entities、references、synthesis、projects、dictionaries、tables 目录）。',
+    '完成后报告：库根路径、是否新建、当前页数。不要在此步骤采集或写入知识页。',
+  ].join('')
+  const doInit = async () => {
+    const text = initInstruction()
+    const res = startAgentSession
+      ? await startAgentSession(text, current?.root)
+      : { ok: false, message: '宿主未提供新建会话能力' }
+    if (!res.ok) {
+      try { await navigator.clipboard.writeText(text) } catch { /* 提示里给出降级说明 */ }
+      flash(`无法新建会话（${res.message ?? '未知原因'}）：初始化指令已复制，请粘贴到对话发送给 Agent`, 'err')
+      return
+    }
+    flash(res.message
+      ? `已新建会话并预填初始化指令，但请注意：${res.message}`
+      : '已新建会话并预填初始化指令：切到该新会话后回车发送，Agent 会用 wiki_init 建库')
+    setTimeout(() => { load().catch(() => {}) }, 4000)
+  }
+
   const doRemove = async () => {
     if (!current || current.source !== 'attached') return
     if (!window.confirm(`从列表中移除知识库「${current.name}」？\n不会删除磁盘上的任何文件。`)) return
@@ -171,6 +203,18 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
         <span className="knj-vault__path" title={current.root}>{current.root}</span>
       )}
       <span className="knj-statusbar__spacer" />
+      {current && !(vaults.find((v) => v.id === current.id)?.initialized ?? true) && (
+        <button type='button' className="knj-btn knj-btn--sm knj-btn--primary" disabled={busy}
+          title={`此工作区还没有 .wiki，点此把初始化交给当前对话 Agent（wiki_init）`} onClick={doInit}>
+          初始化知识库
+        </button>
+      )}
+      {current && !(vaults.find((v) => v.id === current.id)?.initialized ?? true) && (
+        <span className="knj-chip knj-chip--neutral" title='磁盘上还没有 .wiki：注册 ≠ 建库'>未初始化</span>
+      )}
+      <button type='button' className="knj-icon-btn" title='刷新库列表' onClick={() => { load().catch(() => {}) }}>
+        <IconRefresh size={14} />
+      </button>
       {current?.source === 'attached' && (
         <button type='button' className="knj-icon-btn knj-icon-btn--danger" title='从列表移除（不删文件）' onClick={doRemove}>
           <IconTrash size={14} />
@@ -181,8 +225,6 @@ export function VaultHeader({ workspaces, sessions, onVaultChanged }: {
         {manageOpen ? <IconChevronDown size={14} /> : <IconGear size={14} />}
       </button>
     </div>
-
-    {diag && <div className="knj-diag" style={{ fontSize: 11, lineHeight: 1.4, color: 'var(--knj-text-3, #888)', wordBreak: 'break-all', margin: '2px 0 4px' }}>{diag}</div>}
 
     <select className="knj-select knj-vault__select" value={current?.id ?? ''}
       onChange={(e) => handleSwitch(e.target.value)} disabled={busy} title='切换知识库'>

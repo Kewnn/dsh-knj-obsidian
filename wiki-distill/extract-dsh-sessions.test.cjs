@@ -41,5 +41,18 @@ t('redact: plain Chinese text untouched', () => {
   assert.strictEqual(M.redact('插件 v4 UI 重构完成，圆角统一 8px'), '插件 v4 UI 重构完成，圆角统一 8px');
 });
 
+t('sessionIncluded: 无过滤时全通过，过滤时按会话目录/id 匹配（单个会话蒸馏）', () => {
+  assert.strictEqual(M.sessionIncluded('sess-abc', ''), true);
+  assert.strictEqual(M.sessionIncluded('sess-abc', undefined), true);
+  assert.strictEqual(M.sessionIncluded('sess-abc', 'sess-abc'), true);
+  // 前缀匹配：允许用 id 前缀缩略指定；但不是任意子串匹配
+  assert.strictEqual(M.sessionIncluded('sess-abc-123', 'sess-abc'), true);
+  assert.strictEqual(M.sessionIncluded('sess-abc-123', 'abc'), false, '片段出现在中间不应命中');
+  assert.strictEqual(M.sessionIncluded('sess-abc', 'other'), false);
+  // 多个 id 用逗号分隔（批量指定）
+  assert.strictEqual(M.sessionIncluded('sess-b', 'sess-a,sess-b'), true);
+  assert.strictEqual(M.sessionIncluded('sess-c', 'sess-a, sess-b'), false);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -86,6 +86,9 @@ const CATEGORY_COLORS: Record<string, string> = {
   references: '#f97316',
   synthesis: '#a855f7',
   projects: '#6b7280',
+  // v9 字典/表结构页：此前缺色导致与默认灰同色、图例也不出现（节点无法辨识）
+  dictionaries: '#eab308',
+  tables: '#06b6d4',
 }
 
 /**
@@ -128,7 +131,7 @@ export function exportGraphHtml(graph: GraphData): string {
 </head>
 <body>
 <svg id="graph" viewBox="0 0 1200 800"></svg>
-<div id="legend"><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.concepts}"></span>概念</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.entities}"></span>实体</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.references}"></span>参考</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.synthesis}"></span>综合</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.projects}"></span>项目</span><span class="legend-item"><span class="dot" style="border:1px dashed #f87171;background:transparent"></span>断链</span><span class="legend-item"><span class="dot" style="background:#374151"></span>孤儿</span></div>
+<div id="legend"><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.concepts}"></span>概念</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.entities}"></span>实体</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.references}"></span>参考</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.synthesis}"></span>综合</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.projects}"></span>项目</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.dictionaries}"></span>字典</span><span class="legend-item"><span class="dot" style="background:${CATEGORY_COLORS.tables}"></span>数据结构</span><span class="legend-item"><span class="dot" style="border:1px dashed #f87171;background:transparent"></span>断链</span><span class="legend-item"><span class="dot" style="background:#374151"></span>孤儿</span></div>
 <div id="info">${graph.nodes.length} 节点 · ${graph.edges.length} 边 · 拖拽/滚轮缩放${graph.nodes.length > 500 ? ' · 图谱较大（>500 节点），性能受限' : ''}</div>
 <div id="tooltip"></div>
 <script>

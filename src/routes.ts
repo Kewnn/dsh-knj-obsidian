@@ -1,5 +1,6 @@
 // src/routes.ts
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { isAbsolute, relative, resolve } from 'node:path'
 import type { VaultStore } from './vault-store.ts'
 import { SaveError } from './vault-store.ts'
 import { retrieve } from './retriever.ts'
@@ -7,6 +8,8 @@ import { buildGraph } from './graph-engine.ts'
 import { lintVault } from './lint.ts'
 import { rebuildIndex } from './index-builder.ts'
 import { importPath } from './importer.ts'
+import { createCheckpoint, listCheckpoints, restoreCheckpoint } from './checkpoint.ts'
+import { refresherFor, vaultRootOf, type Refresher } from './semantic-refresh.ts'
 import type { VaultProvider } from './types.ts'
 import type { WikiCategory } from './types.ts'
 
@@ -88,7 +91,13 @@ async function guardWrite(request: IncomingMessage): Promise<Record<string, unkn
   return readJsonBody(request)
 }
 
-export function mountWikiRoutes(host: WikiHost, provider: VaultProvider): () => void {
+export interface WikiRoutesDeps {
+  /** 测试注入点：替换语义刷新器（默认真实实现，会读写 ~/.dsh/qmd）。 */
+  refresherFor?: (vaultRoot: string) => Pick<Refresher, 'status' | 'refreshNow'>
+}
+
+export function mountWikiRoutes(host: WikiHost, provider: VaultProvider, deps: WikiRoutesDeps = {}): () => void {
+  const getRefresher = deps.refresherFor ?? refresherFor
   const handler = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const url = new URL(request.url ?? '/', 'http://localhost')
     const path = url.pathname
@@ -98,8 +107,10 @@ export function mountWikiRoutes(host: WikiHost, provider: VaultProvider): () => 
       return
     }
     try {
-      // GET 全部走只读视图（零 mkdir 写副作用）；写路径才走 current()（首次会 ensure 脚手架）
-      const store = (method === 'GET' ? provider.currentReadonly() : provider.current()) as VaultStore
+      // 只有真正写页面的端点才走 current()（首次会 ensure 脚手架）；其余（GET、vault 管理、
+      // 校验类 POST）一律只读视图，避免“切库/查询即建库”把未初始化库标记成已初始化。
+      const WRITE_PATHS = new Set([`${BASE}/page`, `${BASE}/rebuild-index`, `${BASE}/import`, `${BASE}/checkpoint/restore`])
+      const store = (method === 'POST' && WRITE_PATHS.has(path) ? provider.current() : provider.currentReadonly()) as VaultStore
       // ---- v7 vault 管理端点 ----
       if (path === `${BASE}/vaults` && method === 'GET') {
         sendJson(response, 200, { current: provider.currentRecord(), vaults: provider.listVaults() })
@@ -133,6 +144,27 @@ export function mountWikiRoutes(host: WikiHost, provider: VaultProvider): () => 
           return
         }
         sendJson(response, 200, { current: provider.currentRecord(), vaults: provider.listVaults() })
+        return
+      }
+      // ---- v8 语义检索：状态 + 手动刷新（只读 store 视图；刷新只写 ~/.dsh/qmd 外部索引，不碰 vault） ----
+      if (path === `${BASE}/semantic-status` && method === 'GET') {
+        const refresher = getRefresher(vaultRootOf(store))
+        sendJson(response, 200, await refresher.status())
+        return
+      }
+      if (path === `${BASE}/semantic-update`) {
+        if (method !== 'POST') { sendJson(response, 405, { error: 'method not allowed' }); return }
+        const refresher = getRefresher(vaultRootOf(store))
+        const before = await refresher.status()
+        if (before.refreshing) {
+          // 单飞：已在刷新就直接回报，不排队（真实库冷启动约 1.5 分钟）
+          sendJson(response, 202, { started: false, running: true, status: before })
+          return
+        }
+        // 后台跑：立刻返回，进度由 semantic-status 轮询
+        void refresher.refreshNow()
+        const after = await refresher.status()
+        sendJson(response, 202, { started: true, running: after.refreshing, status: after })
         return
       }
       if (method === 'GET' && path === `${BASE}/pages`) {
@@ -169,6 +201,9 @@ export function mountWikiRoutes(host: WikiHost, provider: VaultProvider): () => 
         try { payload = JSON.parse(bodyText) } catch { sendJson(response, 400, { error: 'invalid json body' }); return }
         if (typeof payload.raw !== 'string') { sendJson(response, 400, { error: 'field "raw" (string) is required' }); return }
         const page = store.saveRawPage(id, category, payload.raw)
+        // 全文编辑可能改到标题/摘要（或者手工加删页面级信息），而 index.md 是派生工件：
+        // 不同步重建的话，页面改了、L1/index-only 检索看到的还是旧的。
+        try { rebuildIndex(store) } catch { /* 索引重建失败不影响保存结果 */ }
         sendJson(response, 200, { page })
         return
       }
@@ -204,8 +239,34 @@ export function mountWikiRoutes(host: WikiHost, provider: VaultProvider): () => 
         try { payload = JSON.parse(bodyText) } catch { sendJson(response, 400, { error: 'invalid json body' }); return }
         if (typeof payload.path !== 'string' || !payload.path) { sendJson(response, 400, { error: 'field "path" (string) is required' }); return }
         const category = (typeof payload.category === 'string' && payload.category ? payload.category : 'references') as WikiCategory
-        const report = importPath(store, payload.path, category)
+        // 路径边界（安全）：只允许导入【已注册库根目录内】的 Markdown。
+        // 否则同源脚本可借 /import 把用户任意目录里的 .md 拖进可检索/可导出的知识库。
+        const target = resolve(payload.path)
+        const roots = provider.listVaults().map((v) => resolve(v.root))
+        const contained = roots.some((root) => {
+          const rel = relative(root, target)
+          return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+        })
+        if (!contained) {
+          throw new SaveError(400, `仅允许导入已注册知识库根目录内的 Markdown：${target}；如需导入其他位置，请先挂接该目录为库`)
+        }
+        const report = importPath(store, target, category)
         sendJson(response, 200, report)
+        return
+      }
+      if (method === 'GET' && path === `${BASE}/checkpoints`) {
+        sendJson(response, 200, { checkpoints: listCheckpoints(store) })
+        return
+      }
+      if (method === 'POST' && path === `${BASE}/checkpoint/restore`) {
+        const payload = await guardWrite(request)
+        if (typeof payload.id !== 'string' || !payload.id) throw new SaveError(400, 'field "id" (string) is required')
+        // 默认 merge（非破坏性）：只撤销快照内页面的修改，保留快照之后新增的页面；
+        // exact 需显式传入，用于整库回到快照状态。
+        const mode = payload.mode === 'exact' ? 'exact' : 'merge'
+        const result = restoreCheckpoint(store, payload.id, mode)
+        rebuildIndex(store)
+        sendJson(response, 200, result)
         return
       }
       sendJson(response, 404, { error: 'not found' })

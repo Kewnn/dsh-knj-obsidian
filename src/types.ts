@@ -11,6 +11,12 @@ export type WikiCategory = 'concepts' | 'entities' | 'references' | 'synthesis' 
 
 export type Confidence = 'extracted' | 'inferred' | 'ambiguous'
 
+/**
+ * 页面重要性分层（frontmatter `tier:`）。检索打分按此加权：
+ * core 1.3 / supporting 1.0 / peripheral 0.7；缺省或无法识别的值一律视为 supporting。
+ */
+export type WikiTier = 'core' | 'supporting' | 'peripheral'
+
 export interface WikiPage {
   /** 稳定 id（通常为文件 basename 去扩展名，kebab-case） */
   id: string
@@ -24,6 +30,15 @@ export interface WikiPage {
   updated: string
   /** markdown 正文（不含 frontmatter） */
   body: string
+  /**
+   * 一句话摘要（frontmatter `summary:`）。本地检索打分与外部工具（obsidian-wiki
+   * graph-query 的 index_only 快路径）都读它，缺了就没有摘要能力。
+   * 写入端缺省时由 writePage 从正文首行派生；**读取端不派生**——磁盘上没有该字段
+   * 就按「无摘要」处理，与外部读者看到的一致。
+   */
+  summary?: string
+  /** 重要性分层（frontmatter `tier:`），检索打分的权重来源。缺省视为 supporting。 */
+  tier?: WikiTier
 }
 
 export interface ManifestEntry {
@@ -51,9 +66,11 @@ export interface VaultRecord {
   source: 'cwd' | 'workspace' | 'attached'
 }
 
-/** vault 列表条目（含只读页数，供「内容规模」展示） */
+/** vault 列表条目（含只读页数与是否已初始化 .wiki，供「内容规模」与初始化引导展示） */
 export interface VaultListEntry extends VaultRecord {
   pageCount: number
+  /** 磁盘上是否已有 .wiki（注册 ≠ 建库；未初始化时 UI 提供初始化入口） */
+  initialized: boolean
 }
 
 /**

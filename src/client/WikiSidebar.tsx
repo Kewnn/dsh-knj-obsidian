@@ -10,20 +10,20 @@ import { VaultTree } from './VaultTree.tsx'
 import { SearchBox } from './SearchBox.tsx'
 import { LintPanel } from './LintPanel.tsx'
 import { GraphView } from './GraphView.tsx'
-import { CodeCollectLauncher } from './CodeCollectLauncher.tsx'
+import { KnowledgeDistillLauncher } from './KnowledgeDistillLauncher.tsx'
 import { VaultHeader, type SessionFace, type WorkspaceFace } from './VaultHeader.tsx'
-import { IconBook, IconClose, IconGraph, IconImport } from './icons.tsx'
+import { IconBook, IconClose, IconGraph, IconImport, IconSparkles } from './icons.tsx'
 import type { SearchCandidate } from './api.ts'
 
-export function WikiSidebar({ openNote, workspaces, sessions, sendToAgent }: {
+export function WikiSidebar({ openNote, workspaces, sessions, startAgentSession }: {
   openNote: (id: string, category: string, title: string) => void
   workspaces?: WorkspaceFace
   sessions?: SessionFace
-  /** v9：预填当前对话输入框。返回 ''=成功，非空=失败原因（UI 显示并退回复制）。 */
-  sendToAgent?: (instruction: string) => string
+  /** v11：新建会话并预填指令（ok=false 时 message 为失败原因）；cwd 指定新会话所属工作区。 */
+  startAgentSession?: (instruction: string, cwd?: string) => Promise<{ ok: boolean; message?: string }>
 }) {
   const [results, setResults] = useState<SearchCandidate[] | null>(null)
-  const [view, setView] = useState<'browse' | 'graph' | 'collect'>('browse')
+  const [view, setView] = useState<'browse' | 'graph' | 'collect' | 'distill'>('browse')
   // v7：库切换时自增，强制图谱重挂载（取数当前库）
   const [vaultVersion, setVaultVersion] = useState(0)
 
@@ -35,7 +35,7 @@ export function WikiSidebar({ openNote, workspaces, sessions, sendToAgent }: {
   }
 
   return <div className="knj-wiki knj-vcol">
-    <VaultHeader workspaces={workspaces} sessions={sessions} onVaultChanged={handleVaultChanged} />
+    <VaultHeader workspaces={workspaces} sessions={sessions} startAgentSession={startAgentSession} onVaultChanged={handleVaultChanged} />
     <SearchBox onResult={setResults} />
 
     <div style={{ padding: '8px 12px 4px' }}>
@@ -49,8 +49,9 @@ export function WikiSidebar({ openNote, workspaces, sessions, sendToAgent }: {
           <IconGraph size={13} />图谱
         </button>
         <button type='button' className={`knj-seg__item${view === 'collect' ? ' knj-seg__item--active' : ''}`}
+          title='代码结构采集 / 近期会话蒸馏'
           onClick={() => setView('collect')}>
-          <IconImport size={13} />代码采集
+          <IconSparkles size={13} />知识蒸馏
         </button>
       </div>
     </div>
@@ -60,7 +61,7 @@ export function WikiSidebar({ openNote, workspaces, sessions, sendToAgent }: {
         // key=vaultVersion：库切换后强制重挂载，避免展示旧库图谱
         <div key={vaultVersion}><GraphView onOpenNote={openNote} /></div>
       ) : view === 'collect' ? (
-        <CodeCollectLauncher sendToAgent={sendToAgent} />
+        <KnowledgeDistillLauncher startAgentSession={startAgentSession} sessions={sessions as never} workspaces={workspaces as never} />
       ) : results !== null ? (
         <div className="knj-vcol">
           <div className="knj-result-head">

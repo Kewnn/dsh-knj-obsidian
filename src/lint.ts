@@ -1,16 +1,121 @@
 // src/lint.ts
 import type { VaultStore } from './vault-store.ts'
+import { loadTaxonomy, isSystemTag, TAG_LIMIT, TYPE_SECTION, type Taxonomy, type LoadTaxonomyOptions } from './taxonomy.ts'
+
+/** 标签审计结果（对齐上游 tag-taxonomy Mode 1 的四类问题 + 分层词表带来的两项提示）。 */
+export interface TagAudit {
+  /** 是否存在可用词表（基础层或本库层任一有效）。false 时 unknown/aliasUsed/promote 恒为空 */
+  taxonomyPresent: boolean
+  /** 是否存在有效的**本库**词表文件（_meta/taxonomy.md）。false 表示只靠基础层的 Type 轴 */
+  vaultTaxonomyPresent: boolean
+  /** 不在词表里的标签（≥1 页）*/
+  unknown: { tag: string; pages: string[] }[]
+  /** 用了别名而非规范词 */
+  aliasUsed: { tag: string; canonical: string; pages: string[] }[]
+  /** 超过每页上限的页（系统标签不计入）*/
+  overTagged: { id: string; count: number; tags: string[] }[]
+  /** 零标签页（系统标签不算「有标签」）*/
+  untagged: string[]
+  /**
+   * 升表候选：出现 **≥2 页**的未知词。按词表自己的门槛，只有这些才值得进库级词表——
+   * 只出现 1 页的应当换成更宽的规范词，而不是新增。
+   */
+  promote: { tag: string; pages: string[] }[]
+  /**
+   * 「上游候选」：本库词表里新增的 Type 词（基础层没有）。Type 轴影响跨项目可比性，
+   * 所以新 Type 词先在库级用一阵，确认在 ≥2 个项目都要用后再提到基础层随插件发布。
+   */
+  localTypeTags: string[]
+  /**
+   * 「遮蔽」：库级词表**重复登记了基础层已有的词**。因为合并规则是「库级覆盖基础层」，
+   * 这些重复项会让基础层对该词的后续更新永远到不了这个库。库级文件只该管 Domain/Project。
+   */
+  shadowedBaseTags: string[]
+}
 
 export interface LintReport {
   orphans: string[]
   brokenLinks: { from: string; target: string }[]
   missingFrontmatter: string[]
   pageCount: number
+  /** 标签审计（对齐上游 tag-taxonomy；无有效词表时仍给出 overTagged/untagged） */
+  tags: TagAudit
 }
 
 const WIKILINK_RE = /\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/g
 
-export function lintVault(store: VaultStore): LintReport {
+/** 业务标签：排除系统标签组（visibility/*）——它们不计上限、不参与别名映射、不算未知。 */
+function domainTags(tags: readonly string[]): string[] {
+  return tags.filter((t) => !isSystemTag(t))
+}
+
+/**
+ * 标签审计。四类问题与上游一致：未知 / 别名 / 超上限 / 零标签；另加两项分层带来的提示：
+ * 升表候选（≥2 页的未知词）与上游候选（库级新增的 Type 词）。
+ *
+ * 设计取舍（对齐上游）：
+ * - 没有**任何**有效词表时**不报**未知/别名/升表——没有「规范」可言，把整库标签报成未知只会是噪声。
+ *   超上限与零标签不依赖词表，照报。
+ * - 系统标签 visibility/* 全部豁免：不计上限、不查别名、不算未知，也不算「这页有标签」。
+ * - 判定优先级：规范词 > 别名 > 未知。
+ */
+export function auditTags(store: VaultStore, taxonomy: Taxonomy | null = loadTaxonomy(store)): TagAudit {
+  const pages = store.listPages()
+  const unknownPages = new Map<string, string[]>()
+  const aliasPages = new Map<string, { canonical: string; pages: string[] }>()
+  const overTagged: TagAudit['overTagged'] = []
+  const untagged: string[] = []
+
+  for (const p of pages) {
+    const page = store.readPage(p.id, p.category)
+    if (!page) continue // 无 frontmatter 的页已由 missingFrontmatter 报，这里不重复报
+    const tags = domainTags(page.tags)
+    if (tags.length === 0) untagged.push(p.id)
+    if (tags.length > TAG_LIMIT) overTagged.push({ id: p.id, count: tags.length, tags })
+    if (!taxonomy) continue
+    for (const t of tags) {
+      const canonical = taxonomy.aliases.get(t)
+      if (canonical) {
+        const hit = aliasPages.get(t) ?? { canonical, pages: [] }
+        hit.pages.push(p.id)
+        aliasPages.set(t, hit)
+      } else if (!taxonomy.canonical.has(t)) {
+        const list = unknownPages.get(t) ?? []
+        list.push(p.id)
+        unknownPages.set(t, list)
+      }
+    }
+  }
+
+  const byTag = (a: { tag: string }, b: { tag: string }) => (a.tag < b.tag ? -1 : 1)
+  const unknown = [...unknownPages.entries()].map(([tag, pgs]) => ({ tag, pages: pgs })).sort(byTag)
+
+  return {
+    taxonomyPresent: taxonomy !== null,
+    vaultTaxonomyPresent: taxonomy?.hasVaultFile ?? false,
+    unknown,
+    aliasUsed: [...aliasPages.entries()].map(([tag, v]) => ({ tag, canonical: v.canonical, pages: v.pages })).sort(byTag),
+    overTagged,
+    untagged,
+    // 升表门槛就是词表自己写的那条：≥2 页才值得新增
+    promote: unknown.filter((u) => u.pages.length >= 2),
+    localTypeTags: taxonomy
+      ? taxonomy.entries
+        .filter((e) => e.origin === 'vault' && e.section === TYPE_SECTION && !taxonomy.baseTags.has(e.tag))
+        .map((e) => e.tag)
+        .sort()
+      : [],
+    // 库级重复登记基础层已有的词 → 会遮蔽基础层的后续更新
+    shadowedBaseTags: taxonomy
+      ? taxonomy.entries
+        .filter((e) => e.origin === 'vault' && taxonomy.baseTags.has(e.tag))
+        .map((e) => e.tag)
+        .sort()
+      : [],
+  }
+}
+
+export function lintVault(store: VaultStore, opts: LoadTaxonomyOptions = {}): LintReport {
   const pages = store.listPages()
   const ids = new Set(pages.map((p) => p.id))
   const incoming = new Map<string, string[]>()
@@ -56,5 +161,5 @@ export function lintVault(store: VaultStore): LintReport {
     })
     .map((p) => p.id)
 
-  return { orphans, brokenLinks, missingFrontmatter, pageCount: pages.length }
+  return { orphans, brokenLinks, missingFrontmatter, pageCount: pages.length, tags: auditTags(store, loadTaxonomy(store, opts)) }
 }

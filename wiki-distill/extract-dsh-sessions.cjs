@@ -46,7 +46,19 @@ function redact(s) {
   return out;
 }
 
-module.exports = { shouldIncludeFile, isTopLevel, digestSubagent, redact };
+/**
+ * 单会话蒸馏过滤：filter 为空/未给 → 全通过；否则按逗号分隔的片段匹配会话目录名。
+ * 匹配语义 = 精确相等 或 前缀匹配（不是任意子串）：避免用片段（如 "abc"）意外命中
+ * 名称里恰好包含该片段的无关会话，把别的会话也蒸进来。
+ */
+function sessionIncluded(sessDir, sessionFilter) {
+  const raw = typeof sessionFilter === 'string' ? sessionFilter.trim() : '';
+  if (!raw) return true;
+  const name = String(sessDir ?? '');
+  return raw.split(',').map(s => s.trim()).filter(Boolean).some(frag => name === frag || name.startsWith(frag));
+}
+
+module.exports = { shouldIncludeFile, isTopLevel, digestSubagent, redact, sessionIncluded };
 
 // ---------- extraction pipeline ----------
 
@@ -57,6 +69,8 @@ async function main() {
   const outDir = process.argv[3];
   const projectFilter = process.argv[4] || '';
   const minMtime = process.argv[5] ? Date.parse(process.argv[5]) : 0;
+  // 单会话蒸馏：第 6 参数按 session id（目录名）过滤，逗号分隔可给多个；空=全部
+  const sessionFilter = process.argv[6] || '';
   fs.mkdirSync(path.join(outDir, 'sessions'), { recursive: true });
 
   const projects = fs.readdirSync(sessionsRoot).filter(d => {
@@ -67,6 +81,7 @@ async function main() {
     if (projectFilter && !proj.includes(projectFilter)) continue;
     const projDir = path.join(sessionsRoot, proj);
     for (const sessDir of fs.readdirSync(projDir)) {
+      if (!sessionIncluded(sessDir, sessionFilter)) continue;
       const f = path.join(projDir, sessDir, 'session.jsonl.zstd');
       if (!fs.existsSync(f)) continue;
       const st = fs.statSync(f);

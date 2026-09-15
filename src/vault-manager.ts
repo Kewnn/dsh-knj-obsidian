@@ -117,7 +117,12 @@ export class VaultManager implements VaultProvider {
   // ---------- VaultProvider ----------
 
   listVaults(): VaultListEntry[] {
-    return this.registry.vaults.map((v) => ({ ...v, pageCount: this.countPages(v.root) }))
+    return this.registry.vaults.map((v) => ({
+      ...v,
+      pageCount: this.countPages(v.root),
+      // 未初始化 = 磁盘上还没有 .wiki（注册≠建库；初始化只由显式动作或首次写入触发）
+      initialized: existsSync(join(v.root, '.wiki')),
+    }))
   }
 
   currentRecord(): VaultRecord | null {
@@ -160,10 +165,30 @@ export class VaultManager implements VaultProvider {
     return rec
   }
 
+  /**
+   * 自动跟随（工作区激活）：只注册 + 切换当前库，**不写盘建库**。
+   * 建库是显式动作（边栏「初始化知识库」→ agent 调 wiki_init，或用户显式挂接/首次真实写入）。
+   */
   activateRoot(root: string): VaultRecord {
     const r = resolve(root)
     const existing = this.registry.vaults.find((v) => resolve(v.root) === r)
-    const rec = existing ?? this.attachRoot(r)
+    const rec = existing ?? this.registerRoot(r)
+    this.registry.currentVaultId = rec.id
+    this.persist()
+    return rec
+  }
+
+  /** 只登记进注册表（零写盘）：未注册目录的自动发现路径用。 */
+  private registerRoot(root: string, name?: string): VaultRecord {
+    const r = resolve(root)
+    const removed = this.registry.removedRoots ?? []
+    if (removed.some((x) => resolve(x) === r)) {
+      this.registry.removedRoots = removed.filter((x) => resolve(x) !== r)
+    }
+    const already = this.registry.vaults.find((v) => resolve(v.root) === r)
+    if (already) return already
+    const rec: VaultRecord = { id: vaultIdOf(r), name: name?.trim() || basename(r) || r, root: r, source: 'workspace' }
+    this.registry.vaults.push(rec)
     this.registry.currentVaultId = rec.id
     this.persist()
     return rec

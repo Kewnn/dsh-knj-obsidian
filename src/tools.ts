@@ -3,15 +3,22 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { VaultStore } from './vault-store.ts'
 import type { VaultProvider } from './types.ts'
-import type { WikiCategory, Confidence, WikiPage } from './types.ts'
-import { lintVault } from './lint.ts'
+import type { WikiCategory, WikiTier, Confidence, WikiPage } from './types.ts'
+import { lintVault, auditTags } from './lint.ts'
+import { loadTaxonomy, SYSTEM_TAG_PREFIX } from './taxonomy.ts'
 import { retrieve } from './retriever.ts'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { buildGraph, exportGraphHtml } from './graph-engine.ts'
 import { mineEnums, mineTables } from './code-miner.ts'
 import { readProgress, markModule, pendingModules, progressFileFor } from './mining-progress.ts'
 import { relatedHits } from './related-check.ts'
+import { createCheckpoint, listCheckpoints } from './checkpoint.ts'
+import { rebuildIndex } from './index-builder.ts'
+import {
+  createSemanticRuntime, clampLimit, runOfflineSearch, notReadyMessage, resolveStateHome, DEFAULT_MODEL_FILENAME,
+} from './semantic-index.ts'
+import { refresherFor, vaultRootOf } from './semantic-refresh.ts'
 
 /** wiki_mine 输出的表候选 items（dbNew/dbChanged/dbUnchanged/tables 共用）。 */
 const TABLE_ITEM_SCHEMA = {
@@ -55,8 +62,82 @@ const TABLE_ITEM_SCHEMA = {
   },
 } as const
 
-/** 每个工具执行时解析当前库（v7：agent 工具跟随 UI 切换的当前库）。 */
+/** 每个工具执行时解析当前库（v7：agent 工具跟随 UI 切换的当前库）。写路径必须 ensure 脚手架。 */
 function currentStore(provider: VaultProvider): VaultStore {
+  return provider.current() as VaultStore
+}
+
+/**
+ * 写页后主动回报的标签现状（**全库口径**，不是本批次口径）——把标签维护从「拉」变「推」：
+ * 不主动报，词表就永远不会演化（没人会想起来调 wiki_lint）。
+ * 只报，不改：新增规范词是知识分类判断，必须由人/agent 决定。
+ */
+export interface TagHint {
+  taxonomyPresent: boolean
+  unknownCount: number
+  aliasCount: number
+  untaggedCount: number
+  /** 出现 ≥2 页的未知词 —— 达到词表自己的升表门槛，可直接粘进库级词表 */
+  promote: { tag: string; pages: string[] }[]
+  localTypeTags: string[]
+  shadowedBaseTags: string[]
+}
+
+function tagHintOf(store: VaultStore): TagHint {
+  const t = auditTags(store)
+  return {
+    taxonomyPresent: t.taxonomyPresent,
+    unknownCount: t.unknown.length,
+    aliasCount: t.aliasUsed.length,
+    untaggedCount: t.untagged.length,
+    promote: t.promote,
+    localTypeTags: t.localTypeTags,
+    shadowedBaseTags: t.shadowedBaseTags,
+  }
+}
+
+/** 标签提示的统一文案。promote 给成可粘贴形式，让维护动作退化成复制粘贴。 */
+function renderTagHint(h: TagHint): string {
+  if (!h.taxonomyPresent) return '标签：无有效词表'
+  const bits = [`未知 ${h.unknownCount}`, `别名 ${h.aliasCount}`, `零标签 ${h.untaggedCount}`]
+  const tail: string[] = []
+  if (h.promote.length > 0) tail.push(`建议升表（≥2 页，粘进 _meta/taxonomy.md）：${h.promote.map((p) => `\`${p.tag}\`(${p.pages.length}页)`).join('、')}`)
+  if (h.localTypeTags.length > 0) tail.push(`上游候选 Type 词：${h.localTypeTags.map((x) => `\`${x}\``).join('、')}`)
+  if (h.shadowedBaseTags.length > 0) tail.push(`⚠ 库级词表重复登记了基础层已有的词（会遮蔽基础层更新，建议删掉）：${h.shadowedBaseTags.map((x) => `\`${x}\``).join('、')}`)
+  return `标签（全库）：${bits.join('，')}${tail.length > 0 ? '；' + tail.join('；') : ''}`
+}
+
+/** wiki_ingest / wiki_capture 共用的 tagAudit 输出 schema 片段。
+ *  注意两点：
+ *  1) **不加外层 `required: true`** —— ingest 的 contentHash 命中会走「跳过」快路径，那条路
+ *     不该为了报标签而多跑一遍全库审计，所以 tagAudit 是可选的。
+ *  2) `as const` 不可省：抽成常量后失去字面量上下文，TS 会把 `type: 'object'` 拓宽成 string，
+ *     不再满足 schema 的判别联合类型。 */
+const TAG_HINT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    taxonomyPresent: { type: 'boolean', required: true },
+    unknownCount: { type: 'number', required: true },
+    aliasCount: { type: 'number', required: true },
+    untaggedCount: { type: 'number', required: true },
+    promote: {
+      type: 'array', required: true,
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: { tag: { type: 'string', required: true }, pages: { type: 'array', items: { type: 'string' }, required: true } },
+      },
+    },
+    localTypeTags: { type: 'array', items: { type: 'string' }, required: true },
+    shadowedBaseTags: { type: 'array', items: { type: 'string' }, required: true },
+  },
+} as const
+
+/** 只读工具用：零写副作用（不 ensure/mkdir），避免“查询即建库”把未初始化库标记成已初始化。
+ *  防御式：真实 provider（VaultStore/VaultManager）都实现 currentReadonly；测试替身只有 current()
+ *  时回退，保证只读语义不因替身缺方法而崩溃。 */
+function currentReadonlyStore(provider: VaultProvider): VaultStore {
+  const p = provider as VaultProvider & { currentReadonly?: () => unknown }
+  if (typeof p.currentReadonly === 'function') return p.currentReadonly() as VaultStore
   return provider.current() as VaultStore
 }
 
@@ -77,6 +158,10 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
             category: { type: 'string', required: true, enum: ['concepts', 'entities', 'references', 'synthesis', 'projects', 'dictionaries', 'tables'] },
             tags: { type: 'array', items: { type: 'string' } },
             confidence: { type: 'string', enum: ['extracted', 'inferred', 'ambiguous'] },
+            // 人工摘要与分层：给了就落进 frontmatter。摘要必须与正文不同的措辞才有检索价值
+            // （摘要层只在正文不命中时才产生候选），故这里只透传、不代写。
+            summary: { type: 'string', description: '一句话摘要（写入 frontmatter summary:）；缺省时沿用页面已有摘要，仍无则从正文首行派生' },
+            tier: { type: 'string', enum: ['core', 'supporting', 'peripheral'], description: '重要性分层（写入 frontmatter tier:）；缺省 supporting' },
             body: { type: 'string', required: true, description: 'markdown 正文，不含 frontmatter' },
           },
           additionalProperties: false,
@@ -90,6 +175,8 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
           created: { type: 'array', items: { type: 'string' }, required: true },
           updated: { type: 'array', items: { type: 'string' }, required: true },
           skipped: { type: 'boolean', required: true },
+          // v12：写入前自动创建的还原点 id（缺省表示快照创建失败）——批次级回滚凭据
+          checkpointId: { type: 'string' },
           // v9：每页库内相关已有页对账（agent 据此补链/去重）
           relatedCheck: {
             type: 'array',
@@ -110,6 +197,8 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
               },
             },
           },
+          // 写页后主动回报全库标签现状（把标签维护从「拉」变「推」）
+          tagAudit: TAG_HINT_SCHEMA,
         },
       },
       render: (_args, value) => {
@@ -121,7 +210,9 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
         const tip = open.length + dup.length > 0
           ? `；对账提示：${[...dup, ...open].slice(0, 6).join('；')}（未链可补链，重复建议并入已有页后重导）`
           : ''
-        return [{ type: 'text', text: `写入 wiki：新建 ${value.created.length} 页，更新 ${value.updated.length} 页${tip}` }]
+        const ckpt = value.checkpointId ? `；还原点 ${value.checkpointId}（不满意可回滚）` : '；⚠ 本次未能创建还原点'
+        const tagTip = value.tagAudit ? `；${renderTagHint(value.tagAudit)}` : ''
+        return [{ type: 'text', text: `写入 wiki：新建 ${value.created.length} 页，更新 ${value.updated.length} 页${ckpt}${tagTip}${tip}` }]
       },
     },
     async execute(args) {
@@ -137,6 +228,10 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
       const now = new Date().toISOString()
       const produced: string[] = []
       const createdPages: Array<{ id: string; title: string; category: WikiCategory; body: string }> = []
+      // 结构性保证（信任优先）：真正写入前**自动创建还原点**，不再只靠提示词要求。
+      // 调用方仍可在报告里引用返回的 checkpointId 做批次级回滚。
+      let checkpointId: string | undefined
+      try { checkpointId = createCheckpoint(store).id } catch { /* 快照失败不阻塞写入，但会在返回里体现为 undefined */ }
       for (const p of args.pages) {
         const cat = p.category as WikiCategory
         const conf = (p.confidence ?? 'extracted') as Confidence
@@ -158,7 +253,7 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
           if (own) { id = own.id; reused = own }
           else id = free
         }
-        const page = {
+        const page: WikiPage = {
           id,
           title: p.title,
           category: cat,
@@ -167,6 +262,11 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
           confidence: conf,
           created: reused && reused.source === args.source ? reused.created : now,
           updated: now,
+          // 只透传调用方显式给出的值：不给就交给 writePage（沿用页面已有摘要，否则从正文派生），
+          // 避免这里塞 undefined 覆盖掉磁盘上的人工摘要。
+          ...(p.summary?.trim() ? { summary: p.summary } : {}),
+          // 未显式给 tier 时沿用页面已有分层，同样不覆盖成缺省值。
+          ...(p.tier ? { tier: p.tier as WikiTier } : reused?.tier ? { tier: reused.tier } : {}),
           body: p.body,
         }
         const res = store.writePage(page)
@@ -185,7 +285,14 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
       const relatedCheck = createdPages
         .map((cp) => ({ id: cp.id, title: cp.title, category: cp.category, related: relatedHits(store, producedSet, cp) }))
         .filter((e) => e.related.length > 0)
-      return { created, updated, skipped: false, relatedCheck }
+      // 索引是派生工件：写完立即重建，避免 L1 检索/索引页在用户手动重建前看不到新页
+      try { rebuildIndex(store) } catch { /* 索引重建失败不影响入库结果 */ }
+      // 语义索引（v8）：落盘后安排一次 debounce 后台刷新（模型未就位时只会如实记录，不联网）
+      try {
+        const root = provider.currentRecord()?.root ?? vaultRootOf(store)
+        refresherFor(root).schedule('wiki_ingest')
+      } catch { /* 刷新调度失败不影响入库结果 */ }
+      return { created, updated, skipped: false, relatedCheck, checkpointId, tagAudit: tagHintOf(store) }
     },
   }))
 
@@ -196,6 +303,9 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
       title: { type: 'string', required: true },
       body: { type: 'string', required: true, description: '声明式知识内容（非对话记录）' },
       category: { type: 'string', enum: ['concepts', 'entities', 'references', 'synthesis', 'projects', 'dictionaries', 'tables'] },
+      tags: { type: 'array', items: { type: 'string' }, description: '标签数组；缺省为空数组（quick 捕获常来不及定标签，可稍后补）' },
+      summary: { type: 'string', description: '一句话摘要（写入 frontmatter summary:）；缺省时沿用页面已有摘要，仍无则从正文首行派生' },
+      tier: { type: 'string', enum: ['core', 'supporting', 'peripheral'], description: '重要性分层（写入 frontmatter tier:）；缺省 supporting' },
     },
     output: {
       schema: {
@@ -213,32 +323,226 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
               },
             },
           },
+          // 写页后主动回报全库标签现状
+          tagAudit: TAG_HINT_SCHEMA,
         },
       },
       render: (_args, value) => {
         const dup = (value.related ?? []).filter((r) => r.strong)
         const tip = dup.length > 0 ? `；⚠ 库内已有同名页 [[${dup[0].id}]]，建议并入或改名` : ''
-        return [{ type: 'text', text: `已沉淀到 ${value.page}${tip}` }]
+        const tagTip = value.tagAudit ? `；${renderTagHint(value.tagAudit)}` : ''
+        return [{ type: 'text', text: `已沉淀到 ${value.page}${tip}${tagTip}` }]
       },
     },
     async execute(args) {
       const store = currentStore(provider)
       const now = new Date().toISOString()
       // kebab-case（保留 CJK 字符）：id 直接用作文件名，VaultStore 校验通过即可
-      const id = args.title.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-+|-+$/g, '') || `note-${Date.now()}`
+      const baseId = args.title.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-').replace(/^-+|-+$/g, '') || `note-${Date.now()}`
       const cat = (args.category ?? 'references') as WikiCategory
+      // 跨源防覆盖 + 防 -N 膨胀（与 importer/wiki_ingest 同语义）：
+      // ① 同名页来自其他 source → 不覆盖；② 先找自己（agent:capture）的 -N 页更新，
+      // 只有确实没有才取第一个空闲后缀新建（否则每次重捕都再避让一次，堆 -3/-4…）。
+      let id = baseId
+      let priorCreated: string | undefined
+      const base = store.readPage(baseId, cat)
+      if (base && base.source === 'agent:capture') {
+        priorCreated = base.created
+      } else if (base) {
+        let own: string | undefined
+        let free: string | undefined
+        for (let suffix = 2; !own && !free; suffix++) {
+          const candidate = store.readPage(`${baseId}-${suffix}`, cat)
+          if (!candidate) free = `${baseId}-${suffix}`
+          else if (candidate.source === 'agent:capture') own = `${baseId}-${suffix}`
+        }
+        id = own ?? free ?? baseId
+        const target = store.readPage(id, cat)
+        if (target?.source === 'agent:capture') priorCreated = target.created
+      }
+      // 标签：以前硬编码空数组，导致「快速捕获」这条路径结构上不可能有标签。
+      // 现在接受调用方显式给出的标签；不给仍为空数组（保持既有行为，不回归）。
+      const tags = Array.isArray(args.tags)
+        ? args.tags.filter((t): t is string => typeof t === 'string' && t.trim() !== '').map((t) => t.trim())
+        : []
       store.writePage({
-        id, title: args.title, category: cat, tags: [], source: 'agent:capture',
-        confidence: 'inferred', created: now, updated: now, body: args.body,
+        id, title: args.title, category: cat, tags, source: 'agent:capture',
+        confidence: 'inferred', created: priorCreated ?? now, updated: now, body: args.body,
+        // 只在显式给出时透传；否则交给 writePage 沿用已有摘要 / 从正文派生。
+        ...(args.summary?.trim() ? { summary: args.summary } : {}),
+        ...(args.tier ? { tier: args.tier as WikiTier } : {}),
       })
       const related = relatedHits(store, new Set<string>(), { id, title: args.title, category: cat, body: args.body })
-      return { page: `${cat}/${id}.md`, related }
+      // 索引是派生工件：写完必须立即重建。否则新页在 index.md 里看不到，而 index.md 正是
+      // L1 / index-only 检索的唯一来源——实测曾有一个 capture 出来的页面滞后 12 天不可检索。
+      try { rebuildIndex(store) } catch { /* 索引重建失败不影响沉淀结果 */ }
+      return { page: `${cat}/${id}.md`, related, tagAudit: tagHintOf(store) }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wiki_normalize_tags',
+    description: '按词表把页面标签收敛到规范词。默认只做**确定性**的别名映射（pitfalls→pitfall、plugins→dsh）；若要处理词表未登记的未知词（词表规则第 7 条：1 页的换成更宽的规范词），用 mapping 把人工判断显式传进来——本工具自己绝不发明映射。默认 dryRun=true 只报告不改；真要改时先建还原点再改写，返回 checkpointId 可整批回滚。执行完会重建索引。',
+    parameters: {
+      dryRun: { type: 'boolean', description: 'true（默认）= 只报告将改哪些页，不落盘；false = 真实改写（会先建还原点）' },
+      mapping: {
+        type: 'array',
+        description: '显式替换表（承载人工判断）：{from, to} 把 from 收敛成规范词 to；省略 to 表示删除该标签。别名映射自动进行，无需在此重复。',
+        items: {
+          type: 'object', additionalProperties: false,
+          properties: { from: { type: 'string', required: true }, to: { type: 'string' } },
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          dryRun: { type: 'boolean', required: true },
+          checkpointId: { type: 'string' },
+          checkpointFailed: { type: 'boolean' },
+          // 每页改动明细：from/to 为标签数组，便于人工核对
+          changed: {
+            type: 'array', required: true,
+            items: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                id: { type: 'string', required: true },
+                category: { type: 'string', required: true },
+                from: { type: 'array', items: { type: 'string' }, required: true },
+                to: { type: 'array', items: { type: 'string' }, required: true },
+              },
+            },
+          },
+          skipped: { type: 'number', required: true },
+          // 改写后仍不是规范词的标签（多为 mapping 里写错目标词）——用来兜住人工判断的手滑
+          stillUnknown: { type: 'array', items: { type: 'string' }, required: true },
+          // 被改到「一个标签都不剩」的页：可能是 mapping 把某页的标签全删了，值得核对
+          becameUntagged: { type: 'array', items: { type: 'string' }, required: true },
+          note: { type: 'string' },
+        },
+      },
+      render: (_args, value) => {
+        const n = value.changed.length
+        const head = value.dryRun
+          ? `试运行：将改写 ${n} 页`
+          : n === 0
+            ? '无需改写：0 页（标签已符合词表）'
+            : `已改写 ${n} 页`
+        // 只在**确实有改动**时才谈还原点：0 改动时不建还原点是正确行为，不能报成失败
+        // （实测踩到过：幂等重跑第二次会误报「未能创建还原点」）。
+        const ckpt = value.dryRun || n === 0
+          ? ''
+          : value.checkpointFailed
+            ? '；⚠ 未能创建还原点，本次改动不可整批回滚'
+            : value.checkpointId
+              ? `；还原点 ${value.checkpointId}（不满意可整批回滚）`
+              : '；⚠ 未创建还原点，本次改动不可整批回滚'
+        const sample = value.changed.slice(0, 5).map((c) => `${c.id}: ${c.from.join('/')} → ${c.to.join('/')}`)
+        const more = value.changed.length > 5 ? `；…其余 ${value.changed.length - 5} 页` : ''
+        const body = sample.length > 0 ? `；${sample.join('；')}${more}` : ''
+        const warn: string[] = []
+        if (value.stillUnknown.length > 0) warn.push(`⚠ 改写后仍非规范词（检查 mapping 目标词）：${value.stillUnknown.map((x) => `\`${x}\``).join('、')}`)
+        if (value.becameUntagged.length > 0) warn.push(`⚠ 这些页被改到一个标签都不剩，请核对：${value.becameUntagged.join('、')}`)
+        const note = value.note ? `；${value.note}` : ''
+        const warnText = warn.length > 0 ? `；${warn.join('；')}` : ''
+        return [{ type: 'text', text: `${head}（跳过 ${value.skipped} 页）${ckpt}${body}${warnText}${note}` }]
+      },
+    },
+    async execute(args) {
+      const dryRun = args.dryRun !== false // 默认 dryRun：写操作必须显式传 false
+      const store = currentStore(provider)
+      const taxonomy = loadTaxonomy(store)
+
+      // 显式替换表：承载**人工判断**（词表规则第 7 条）。本工具不发明映射，只执行给进来的。
+      const explicit = new Map<string, string | null>()
+      for (const m of (args.mapping ?? []) as { from?: unknown; to?: unknown }[]) {
+        const from = typeof m?.from === 'string' ? m.from.trim() : ''
+        if (!from) continue
+        const to = typeof m?.to === 'string' && m.to.trim() !== '' ? m.to.trim() : null
+        explicit.set(from, to)
+      }
+
+      if ((!taxonomy || taxonomy.aliases.size === 0) && explicit.size === 0) {
+        return { dryRun, changed: [], skipped: 0, stillUnknown: [], becameUntagged: [], note: '无有效词表且未提供 mapping，无可归一化的内容' }
+      }
+
+      // 先别名映射（确定性），再显式替换（人工判断），最后同页去重并保持原顺序。
+      const plans: { id: string; category: WikiCategory; from: string[]; to: string[]; page: ReturnType<typeof store.readPage> }[] = []
+      let skipped = 0
+      for (const p of store.listPages()) {
+        const page = store.readPage(p.id, p.category)
+        if (!page) { skipped++; continue } // 无 frontmatter 的页跳过，不抛错
+        const to: string[] = []
+        for (const t of page.tags) {
+          let mapped = taxonomy?.aliases.get(t) ?? t
+          if (explicit.has(mapped)) {
+            const target = explicit.get(mapped)!
+            if (target === null) continue // 显式删除该标签
+            mapped = target
+          }
+          if (!to.includes(mapped)) to.push(mapped)
+        }
+        const same = to.length === page.tags.length && to.every((t, i) => t === page.tags[i])
+        if (same) continue
+        plans.push({ id: p.id, category: p.category, from: [...page.tags], to, page })
+      }
+
+      // 人工判断的手滑兜底：改写后仍非规范词的标签；以及被改空的页
+      const isKnown = (t: string) => t.startsWith(SYSTEM_TAG_PREFIX) || (taxonomy?.canonical.has(t) ?? false)
+      const stillUnknown = [...new Set(plans.flatMap((pl) => pl.to.filter((t) => !isKnown(t))))].sort()
+      const becameUntagged = plans.filter((pl) => pl.from.length > 0 && pl.to.length === 0).map((pl) => pl.id)
+
+      if (dryRun || plans.length === 0) {
+        return {
+          dryRun,
+          changed: plans.map(({ id, category, from, to }) => ({ id, category, from, to })),
+          skipped, stillUnknown, becameUntagged,
+        }
+      }
+
+      // 真实写入：先建还原点（失败不阻塞，但要如实告知不可整批回滚）
+      let checkpointId: string | undefined
+      let checkpointFailed = false
+      try {
+        checkpointId = createCheckpoint(store).id
+      } catch {
+        checkpointFailed = true
+      }
+
+      const now = new Date().toISOString()
+      for (const plan of plans) {
+        const page = plan.page!
+        store.writePage({
+          id: page.id,
+          title: page.title,
+          category: page.category,
+          tags: plan.to,
+          source: page.source,
+          confidence: page.confidence,
+          created: page.created, // 保留创建时间
+          updated: now,
+          body: page.body,
+          // 显式透传摘要与分层，保证 writePage 不会重派生、也不丢字段
+          ...(page.summary ? { summary: page.summary } : {}),
+          ...(page.tier ? { tier: page.tier } : {}),
+        })
+      }
+      try { rebuildIndex(store) } catch { /* 索引重建失败不影响归一化结果 */ }
+
+      return {
+        dryRun: false,
+        ...(checkpointId ? { checkpointId } : {}),
+        ...(checkpointFailed ? { checkpointFailed: true } : {}),
+        changed: plans.map(({ id, category, from, to }) => ({ id, category, from, to })),
+        skipped, stillUnknown, becameUntagged,
+      }
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'wiki_lint',
-    description: '检查 wiki 健康度：孤儿页、断链（[[wikilink]] 指向不存在页）、缺 frontmatter。',
+    description: '检查 wiki 健康度：孤儿页、断链（[[wikilink]] 指向不存在页）、缺 frontmatter，以及标签审计（未知标签 / 用了别名 / 超每页上限 / 零标签页，对齐上游 tag-taxonomy）。',
     parameters: {},
     output: {
       schema: {
@@ -257,21 +561,80 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
           },
           missingFrontmatter: { type: 'array', items: { type: 'string' }, required: true },
           pageCount: { type: 'number', required: true },
+          tags: {
+            type: 'object', required: true, additionalProperties: false,
+            properties: {
+              taxonomyPresent: { type: 'boolean', required: true },
+              vaultTaxonomyPresent: { type: 'boolean', required: true },
+              unknown: {
+                type: 'array', required: true,
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: { tag: { type: 'string', required: true }, pages: { type: 'array', items: { type: 'string' }, required: true } },
+                },
+              },
+              aliasUsed: {
+                type: 'array', required: true,
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    tag: { type: 'string', required: true }, canonical: { type: 'string', required: true },
+                    pages: { type: 'array', items: { type: 'string' }, required: true },
+                  },
+                },
+              },
+              overTagged: {
+                type: 'array', required: true,
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    id: { type: 'string', required: true }, count: { type: 'number', required: true },
+                    tags: { type: 'array', items: { type: 'string' }, required: true },
+                  },
+                },
+              },
+              untagged: { type: 'array', items: { type: 'string' }, required: true },
+              // 遮蔽：库级词表重复登记了基础层已有的词，会让基础层对该词的后续更新失效
+              shadowedBaseTags: { type: 'array', items: { type: 'string' }, required: true },
+              // 升表候选：出现 ≥2 页的未知词（词表自己的门槛）
+              promote: {
+                type: 'array', required: true,
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: { tag: { type: 'string', required: true }, pages: { type: 'array', items: { type: 'string' }, required: true } },
+                },
+              },
+              // 上游候选：本库新增的 Type 词（基础层没有）
+              localTypeTags: { type: 'array', items: { type: 'string' }, required: true },
+            },
+          },
         },
       },
-      render: (_args, value) => [{ type: 'text', text: `lint：${value.pageCount} 页，孤儿 ${value.orphans.length}，断链 ${value.brokenLinks.length}，缺 frontmatter ${value.missingFrontmatter.length}` }],
+      render: (_args, value) => {
+        const t = value.tags
+        const base = `lint：${value.pageCount} 页，孤儿 ${value.orphans.length}，断链 ${value.brokenLinks.length}，缺 frontmatter ${value.missingFrontmatter.length}`
+        if (!t.taxonomyPresent) return [{ type: 'text', text: `${base}；标签：无有效词表（基础词表缺失且本库无 _meta/taxonomy.md），仅报超上限 ${t.overTagged.length} / 零标签 ${t.untagged.length}` }]
+        const scope = t.vaultTaxonomyPresent ? '基础层+本库' : '仅基础层（Type 轴）'
+        const parts = [`词表 ${scope}`, `未知 ${t.unknown.length}`, `别名 ${t.aliasUsed.length}`, `超上限 ${t.overTagged.length}`, `零标签 ${t.untagged.length}`]
+        const hint: string[] = []
+        if (t.promote.length > 0) hint.push(`建议升表（≥2 页，粘进 _meta/taxonomy.md 的 Domain/Project 小节）：${t.promote.map((p) => `\`${p.tag}\`(${p.pages.length}页)`).join('、')}`)
+        if (t.localTypeTags.length > 0) hint.push(`上游候选 Type 词（基础层没有，先在本库用着）：${t.localTypeTags.map((x) => `\`${x}\``).join('、')}`)
+        if (t.shadowedBaseTags.length > 0) hint.push(`⚠ 库级词表重复登记了基础层已有的词（会遮蔽基础层更新，建议从库级文件删掉）：${t.shadowedBaseTags.map((x) => `\`${x}\``).join('、')}`)
+        const tail = hint.length > 0 ? `；${hint.join('；')}` : ''
+        return [{ type: 'text', text: `${base}；标签：${parts.join('，')}${tail}` }]
+      },
     },
     async execute() {
-      return lintVault(currentStore(provider))
+      return lintVault(currentReadonlyStore(provider))
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'wiki_query',
-    description: '从项目 wiki（.wiki/）检索知识。分层：L1 index 快速层（index-only 模式）→ L2 标题/标签 → L3 正文 → L4 wikilink 图谱邻居。只读，不修改任何页面。返回候选页面与引用，答案由调用者基于候选合成。',
+    description: '从项目 wiki（.wiki/）检索知识。分层：L1 index 快速层（index-only 模式）→ L2 标题/标签/摘要 → L3 正文 → L4 wikilink 图谱邻居。候选带相关性 score 并按分降序返回（title 精确10/标题6/标签4/摘要2 + 度加权 × tier 权重），因此第 1 条就是最该先看的页面。只读，不修改任何页面。答案由调用者基于候选合成。',
     parameters: {
       query: { type: 'string', required: true, description: '检索词' },
-      mode: { type: 'string', enum: ['auto', 'index-only'], description: 'auto=分层检索；index-only=只查 index.md（快速）' },
+      mode: { type: 'string', enum: ['auto', 'index-only'], description: 'auto=分层检索；index-only=只查 index.md（快速，不建全图）' },
       maxCandidates: { type: 'number', description: '最多返回候选数（默认 10）' },
     },
     output: {
@@ -290,6 +653,8 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
                 confidence: { type: 'string', required: true },
                 snippet: { type: 'string', required: true },
                 matchedBy: { type: 'string', required: true },
+                score: { type: 'number', required: true },
+                tier: { type: 'string', required: true },
               },
             },
           },
@@ -297,12 +662,13 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
           totalPages: { type: 'number', required: true },
         },
       },
-      render: (_args, value) => value.candidates.length === 0
+      render: (args, value) => value.candidates.length === 0
         ? [{ type: 'text', text: `wiki 无匹配（${value.totalPages} 页）。可以说「把 XX 吸收进 wiki」来添加知识。` }]
-        : [{ type: 'text', text: `检索到 ${value.candidates.length} 条候选（${value.strategy}）：${value.candidates.map((c) => c.id).join('、')}` }],
+        // index-only 刻意保持 index.md 的人工目录顺序、不按分重排，这里就不能声称「按分降序」
+        : [{ type: 'text', text: `检索到 ${value.candidates.length} 条候选（${value.strategy}${args.mode === 'index-only' ? '，按 index.md 目录顺序' : '，按分降序'}）：${value.candidates.map((c) => `${c.id}(${c.score.toFixed(1)})`).join('、')}` }],
     },
     async execute(args) {
-      return retrieve(currentStore(provider), args.query, {
+      return retrieve(currentReadonlyStore(provider), args.query, {
         mode: args.mode === 'index-only' ? 'index-only' : 'auto',
         maxCandidates: args.maxCandidates ?? 10,
       })
@@ -465,12 +831,25 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
       },
     },
     async execute(args) {
-      const store = currentStore(provider)
+      // 挖掘是只读扫描（不建库）；进度只写已初始化库的 _system，避免“挖掘即建库”
+      const store = currentReadonlyStore(provider)
+      const canPersistProgress = existsSync(store.wikiRoot)
       const projectRoot = join(store.wikiRoot, '..') // .wiki 的父目录 = 项目根
       const kind = args.kind ?? 'both'
       const progressFile = progressFileFor(store.wikiRoot, 'enum')
       const progress = readProgress(progressFile, 'enum')
-      const resumeOnly = args.resume ? new Set(pendingModules(progress)) : null
+      const dbProgressFile = progressFileFor(store.wikiRoot, 'db')
+      const dbProgress = readProgress(dbProgressFile, 'db')
+      const resumeOnly = args.resume
+        ? (() => {
+            const pending = new Set([...pendingModules(progress), ...pendingModules(dbProgress)])
+            // 无 pending 记录（首次挖 / 已全部 done）时不做过滤，否则 resume 会把结果全滤空
+            return pending.size > 0 ? pending : null
+          })()
+        : null
+      // deleted 对账只在「未过滤的完整扫描」下才有意义：带 module/resume 过滤时，
+      // 过滤范围之外的文件本来就不会被扫到，不能据此判删（否则对账报告系统性误报）。
+      const isFullScan = !args.module && !args.resume
 
       // ---- 枚举分支 ----
       const enumResult = (kind === 'enum' || kind === 'both')
@@ -481,7 +860,6 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
       const newE: typeof enums = []
       const changedE: typeof enums = []
       const unchangedE: typeof enums = []
-      const scannedFiles = new Set(enums.map((e) => e.file))
       for (const e of enums) {
         const prev = store.manifestEntry(`mine:enum:${e.file}`)
         if (!prev) newE.push(e)
@@ -489,9 +867,12 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
         else changedE.push(e)
       }
       const deleted: string[] = []
-      for (const src of store.manifestSources()) {
-        if (src.startsWith('mine:enum:') && !scannedFiles.has(src.slice('mine:enum:'.length))) {
-          deleted.push(src.slice('mine:enum:'.length))
+      if (isFullScan) {
+        const scannedFiles = new Set(mineEnums(projectRoot).enums.map((e) => e.file))
+        for (const src of store.manifestSources()) {
+          if (src.startsWith('mine:enum:') && !scannedFiles.has(src.slice('mine:enum:'.length))) {
+            deleted.push(src.slice('mine:enum:'.length))
+          }
         }
       }
 
@@ -504,7 +885,6 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
       const dbNew: typeof tables = []
       const dbChanged: typeof tables = []
       const dbUnchanged: typeof tables = []
-      const scannedDbFiles = new Set(tables.map((t) => t.file))
       for (const t of tables) {
         const prev = store.manifestEntry(`mine:db:${t.file}`)
         if (!prev) dbNew.push(t)
@@ -512,14 +892,33 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
         else dbChanged.push(t)
       }
       const dbDeleted: string[] = []
-      for (const src of store.manifestSources()) {
-        if (src.startsWith('mine:db:') && !scannedDbFiles.has(src.slice('mine:db:'.length))) {
-          dbDeleted.push(src.slice('mine:db:'.length))
+      if (isFullScan && (kind === 'db' || kind === 'both')) {
+        const scannedDbFiles = new Set(mineTables(projectRoot).tables.map((t) => t.file))
+        for (const src of store.manifestSources()) {
+          if (src.startsWith('mine:db:') && !scannedDbFiles.has(src.slice('mine:db:'.length))) {
+            dbDeleted.push(src.slice('mine:db:'.length))
+          }
         }
       }
 
       const note = enums.length === 0 && deleted.length === 0 && tables.length === 0 && dbDeleted.length === 0
         ? '当前项目未发现枚举/常量类或数据库表结构' : undefined
+
+      // 断点续传进度落盘（严重修复）：本次「扫描并对账」覆盖到的模块标记为 done，
+      // 未出现在本次结果里的模块（resume 时被过滤掉的）保持原状态。
+      // 这样 wiki_mine { resume: true } 才真正只处理 pending/partial 模块。
+      try {
+        if (!canPersistProgress) throw new Error('vault not initialized; skip progress persistence')
+        if (kind === 'enum' || kind === 'both') {
+          const covered = new Set([...newE, ...changedE, ...unchangedE].map((e) => e.module))
+          for (const m of covered) markModule(progress, m, 'done', progressFile)
+        }
+        if (kind === 'db' || kind === 'both') {
+          const covered = new Set([...dbNew, ...dbChanged, ...dbUnchanged].map((t) => t.module))
+          for (const m of covered) markModule(dbProgress, m, 'done', dbProgressFile)
+        }
+      } catch { /* 进度写失败不影响本次结果 */ }
+
       // lossless JSON：execute 返回值会跨进程序列化，undefined 字段（EnumValue.code/label 等 optional）会被拒绝。
       return JSON.parse(JSON.stringify({
         enums, new: newE, changed: changedE, unchanged: unchangedE, deleted,
@@ -528,6 +927,173 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
         modules: [...enumResult.modules, ...tableResult.modules],
         remaining: resumeOnly ? resumeOnly.size : (enumResult.modules.length + tableResult.modules.length), note,
       }))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wiki_init',
+    description: '初始化知识库：为【当前库】创建 .wiki 脚手架（index.md / .manifest.json / 概念·实体·参考资料·综合·项目知识·字典·数据结构 七个分类目录）。幂等：已存在时只补缺失结构并返回 created=false。工作区里还没有知识库时先用它，再用 wiki-collect/wiki_ingest 写入。要初始化别的库，请先在边栏切到该库。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          root: { type: 'string', required: true },
+          wikiRoot: { type: 'string', required: true },
+          created: { type: 'boolean', required: true },
+          pageCount: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => {
+        const action = value.created ? '已初始化' : '已存在（幂等，无需重复初始化）'
+        return [{ type: 'text', text: `${action}知识库：${value.wikiRoot}（当前 ${value.pageCount} 页）。可继续用 wiki-collect 采集代码结构，或用 wiki_ingest/wiki_capture 写入知识页。` }]
+      },
+    },
+    async execute() {
+      const store = currentStore(provider)
+      const wikiRoot = store.wikiRoot
+      const existed = existsSync(wikiRoot)
+      store.ensure()
+      return { root: (provider.currentRecord()?.root ?? ''), wikiRoot, created: !existed, pageCount: store.listPagesReadonly().length }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wiki_checkpoint',
+    description: '创建知识库还原点：把当前全部知识页 + index.md + .manifest.json 快照到 <vault>/_system/checkpoints/。批量蒸馏/采集入库【之前】必须先调用它拿还原点 id；用户对批次质量不满意时可凭该 id 在边栏一键回滚。恢复操作在 GUI 完成（工具只建快照、不恢复）。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true, description: '还原点 id（时间戳派生）' },
+          createdAt: { type: 'string', required: true },
+          pageCount: { type: 'number', required: true, description: '快照时的页面总数' },
+        },
+      },
+      render: (_args, value) => [
+        { type: 'text', text: `还原点已创建：${value.id}（快照 ${value.pageCount} 页）。请在质量评估报告中引用该 id，用户可凭它回滚本批次。` },
+      ],
+    },
+    async execute() {
+      return createCheckpoint(currentStore(provider))
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wiki_checkpoints',
+    description: '列出当前知识库的全部还原点（新→旧），含 id / createdAt / pageCount。用于回答“有哪些还原点可回滚”。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          checkpoints: {
+            type: 'array', required: true,
+            items: {
+              type: 'object', additionalProperties: false,
+              properties: { id: { type: 'string' }, createdAt: { type: 'string' }, pageCount: { type: 'number' } },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [
+        { type: 'text', text: value.checkpoints.length === 0
+          ? '当前没有还原点。批量入库前请先调用 wiki_checkpoint 创建一个。'
+          : `共 ${value.checkpoints.length} 个还原点：${value.checkpoints.map((c) => `${c.id}(${c.pageCount}页)`).join('、')}` },
+      ],
+    },
+    async execute() {
+      return { checkpoints: listCheckpoints(currentReadonlyStore(provider)) }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wiki_search_semantic',
+    description: '对知识库做【本地语义检索】（进程内集成 QMD 库 + 本地 300M 嵌入模型，不需要单独安装/启动 QMD，也不需要 QMD 插件）。只启用两条离线通道——本地嵌入向量 + BM25 关键词，并在本地 RRF 融合；云端查询扩展/精排模型被显式禁用，任何情况下都不联网下载。返回有界结果（默认 8 条、上限 20）含页面 id/分类/标题/片段/相关度（融合分数，非概率）。模型缺失、索引为空或陈旧时会如实说明并指向更新动作；纯关键词检索请继续用 wiki_query（本工具不假装关键词结果=语义结果）。',
+    parameters: {
+      query: { type: 'string', required: true, description: '自然语言问题或关键词' },
+      limit: { type: 'number', description: '返回条数（默认 8，硬上限 20）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          status: { type: 'string', required: true, description: 'ready | index-empty | index-stale | model-missing | library-missing' },
+          limit: { type: 'number', required: true },
+          count: { type: 'number', required: true },
+          stale: { type: 'boolean' },
+          message: { type: 'string' },
+          results: {
+            type: 'array', required: true,
+            items: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                id: { type: 'string' }, category: { type: 'string' }, title: { type: 'string' },
+                snippet: { type: 'string' }, score: { type: 'number' },
+              },
+            },
+          },
+        },
+      },
+      render: (_args, value) => {
+        if (value.status === 'model-missing' || value.status === 'library-missing') {
+          return [{ type: 'text', text: value.message ?? '语义检索未就绪' }]
+        }
+        const head = value.count === 0
+          ? `语义检索无命中（模板 ${value.status}）`
+          : `语义检索命中 ${value.count} 条（模板 ${value.status}）：${value.results.map((r) => `${r.id}(${r.category})`).join('、')}`
+        const note = value.message ? `；${value.message}` : ''
+        return [{ type: 'text', text: head + note }]
+      },
+    },
+    async execute(args) {
+      const limit = clampLimit(args.limit)
+      const store = currentReadonlyStore(provider)
+      const vaultRoot = provider.currentRecord()?.root ?? join(store.wikiRoot, '..')
+      const runtime = await createSemanticRuntime({ vaultRoot })
+
+      // 严格离线：模型缺失时只给可执行信息，不联网、不报错
+      if (!runtime.modelPresent) {
+        const paths = resolveStateHome()
+        return {
+          status: 'model-missing' as const, limit, count: 0, results: [],
+          message: notReadyMessage('model-missing', paths.modelsDir, DEFAULT_MODEL_FILENAME),
+        }
+      }
+      if (!runtime.store) {
+        return {
+          status: 'library-missing' as const, limit, count: 0, results: [],
+          message: notReadyMessage('library-missing'),
+        }
+      }
+
+      const semantic = runtime.store
+      if (runtime.status === 'index-empty') {
+        return {
+          status: 'index-empty' as const, limit, count: 0, results: [],
+          message: '语义索引为空：请先在边栏点「更新索引」（或让 agent 触发更新），首次全量嵌入约 1–2 分钟。',
+        }
+      }
+
+      // 严格离线：只用「本地嵌入模型向量通道 + BM25 关键词通道」并在本地融合。
+      // 刻意不调用 store.search()——QMD 的混合检索会拉起查询扩展(1.7B)与精排(0.6B)两个云端模型，
+      // 缺失时 node-llama-cpp 会自动去 HuggingFace 下载，与「绝不联网」冲突。
+      try {
+        const outcome = await runOfflineSearch(semantic, args.query, limit)
+        const staleNote = runtime.status === 'index-stale'
+          ? `索引有 ${runtime.index.pendingEmbedding} 篇未嵌入（结果可能不含最新页）：建议点「更新索引」或在边栏查看语义索引状态。`
+          : ''
+        const note = [outcome.degraded, staleNote].filter(Boolean).join('；')
+        return {
+          status: runtime.status, limit, count: outcome.results.length, results: outcome.results,
+          ...(runtime.status === 'index-stale' ? { stale: true } : {}),
+          ...(note ? { message: note } : {}),
+        }
+      } finally {
+        // 每次调用自建的 store 用完即关：不留 sqlite 句柄（索引文件在 ~/.dsh/qmd 下）
+        try { await semantic.close?.() } catch { /* 关闭失败不影响检索结果 */ }
+      }
     },
   }))
 
