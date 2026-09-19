@@ -246,11 +246,17 @@ test('wiki_ingest 落盘后安排语义索引刷新（source 契约：schedule �
   assert.match(src, /refresherFor\(root\)\.schedule\('wiki_ingest'\)/, '入库后应安排 debounce 刷新')
 })
 
-test('打包契约：@tobilu/qmd 是 optionalDependency（内网仓库缺它时插件仍能装上并降级）', () => {
+test('打包契约：@tobilu/qmd 是可选依赖（内网仓库缺它时插件仍能装上并降级）', () => {
   const ROOT = fileURLToPath(new URL('.', import.meta.url))
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
-  assert.equal(pkg.optionalDependencies?.['@tobilu/qmd'], '^2.8.3', '语义检索库必须是可选依赖')
+  // 2026-09-20 迁移：optionalDependencies → optional peerDependency。
+  // 依据：已发布 v2026.9.152 产物的 package.json 即为该形态（peerDependencies + peerDependenciesMeta.optional），
+  // README 亦如此记载。取舍是「不自动安装」——DSH profile 默认 autoInstallPeers=false，
+  // 而 optionalDependencies 会被 pnpm 真的装（连带 node-llama-cpp 的 14 个平台包，内网拉不到）。
+  assert.equal(pkg.peerDependencies?.['@tobilu/qmd'], '^2.8.3', '语义检索库必须声明为 peerDependency')
+  assert.equal(pkg.peerDependenciesMeta?.['@tobilu/qmd']?.optional, true, '必须标 optional：缺库时插件仍能装上')
   assert.equal(pkg.dependencies?.['@tobilu/qmd'], undefined, '不得同时声明为硬依赖（内网缺库会导致整个插件装不上）')
+  assert.equal(pkg.optionalDependencies?.['@tobilu/qmd'], undefined, '不得回退到 optionalDependencies（那会被自动安装，回到内网拉爆的老问题）')
   for (const hard of ['dompurify', 'marked']) {
     assert.ok(pkg.dependencies?.[hard], `${hard} 应为硬依赖`)
   }

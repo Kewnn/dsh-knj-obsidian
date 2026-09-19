@@ -37,6 +37,9 @@ test('离线清单：普通依赖（非平台变体）对所有平台适用', ()
 })
 
 test('离线清单版本与 package.json 的可选依赖声明一致（避免镜像与插件要求脱节）', () => {
-  const declared = String(pkg.optionalDependencies?.['@tobilu/qmd'] ?? '').replace(/^[\^~]/, '')
+  // 2026-09-20 迁移：声明在 optional peerDependency 上（见 tools.test.mjs 的打包契约测试），
+  // 这里兼容两种写法，避免镜像清单与插件要求因迁移而脱节。
+  const declaredVersion = pkg.peerDependencies?.['@tobilu/qmd'] ?? pkg.optionalDependencies?.['@tobilu/qmd']
+  const declared = String(declaredVersion ?? '').replace(/^[\^~]/, '')
   assert.equal(byName.get('@tobilu/qmd').version, declared, '镜像清单里的 qmd 版本必须满足插件声明')
 })

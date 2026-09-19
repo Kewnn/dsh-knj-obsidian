@@ -116,7 +116,15 @@ mkdir -Force $env:USERPROFILE\.dsh\qmd\models
 
 模型缺失时工具**如实回报未就绪**（给出精确路径与文件名），并且**不打开索引库**（不 import 库、不建 sqlite、不留句柄）；关键词检索 `wiki_query` 始终可用。语义状态固定在 `~/.dsh/qmd/`（`models/`、`index.sqlite`、`config.yml`），索引文件不进 vault。
 
-**内网 / 离线部署**：`@tobilu/qmd` 是插件的 **optionalDependency**——内网 npm 仓库没有它时，插件仍能正常安装，语义检索如实降级到 `wiki_query`，不会因为一个可选能力导致整个插件装不上。要让语义检索在内网可用，需要把这批 npm 包（win32-x64 CPU 集约 128 个包、约 205 MB）镜像进内网仓库；工具与清单在**源码仓库**的 `tools/qmd-offline/`（含 `README.md`、`packages.json` 与 `mirror-qmd.mjs` 的 `list/pack/verify` 命令），不随 npm 包分发。
+**内网 / 离线部署**：`@tobilu/qmd` 声明为插件的 **optional peerDependency**（`peerDependenciesMeta` 标 optional）。DSH profile 默认 `autoInstallPeers: false`，因此 **pnpm 不会自动安装它**——这既保证插件本体永远装得上，也避免了它的依赖（`node-llama-cpp` 及其 14 个 `@node-llama-cpp/*` 平台包，其中 CUDA/异平台变体常有上百 MB 且在内网拉不到）在**每次安装任何插件时**被反复尝试下载。
+
+要启用语义检索需**显式安装一次**：
+
+```powershell
+dsh plugin --profile web add @tobilu/qmd@2.8.3
+```
+
+（该命令会连带安装 `node-llama-cpp` 等原生依赖；内网需先把这批包镜像进私有仓库——清单与工具在**源码仓库**的 `tools/qmd-offline/`，含 `README.md`、`packages.json` 与 `mirror-qmd.mjs` 的 `list/pack/verify` 命令，不随 npm 包分发。未安装时 `wiki_search_semantic` 会如实返回 `library-missing` 并保持关键词检索 `wiki_query` 完全可用。）
 
 ### 索引新鲜度与「更新索引」
 
