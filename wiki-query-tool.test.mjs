@@ -7,6 +7,15 @@ import { join } from 'node:path'
 import { VaultStore } from './lib/vault-store.js'
 import { mountTools } from './lib/tools.js'
 
+// 本文件执行 wiki_query：关掉语义兜底，避免单元测试加载真实 300M 嵌入模型、
+// 去碰用户真实的 ~/.dsh/qmd（一次模型冷启动就要几十秒）。
+// 兜底本身的行为由 tools.test.mjs 用注入的假运行时覆盖。
+process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK = 'off'
+
+// 未命中日志（DSH_HOME/knj-obsidian/query-misses.jsonl）必须落在临时 home：
+// 否则测试里的零候选查询会写进用户真实状态，污染"库缺什么"的数据。
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-obsidian-qthome-'))
+
 function makeCtx() {
   const registered = []
   return {

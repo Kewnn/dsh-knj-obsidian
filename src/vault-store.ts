@@ -92,6 +92,61 @@ function assertSaveablePage(page: WikiPage | null, id: string, category: WikiCat
   }
 }
 
+// ---------------------------------------------------------------------------
+// Windows 上的 rename 重试。
+//
+// tmp+rename 是原子写的核心，但 Windows 里「rename 覆盖一个正被打开的文件」会返回
+// EPERM/EACCES/EBUSY：当目标刚被创建时，Defender/索引器的瞬时扫描就足以触发。
+// 实测证据（2026-09-20）：全量并发跑测试时 saveManifest 偶发
+//   EPERM: operation not permitted, rename '<…>.manifest.json.tmp-…' -> '.manifest.json'
+// 而隔离跑同一条用例 40 次全绿；Linux 的 rename 不会这样。
+//
+// 这类竞争通常只持续几十毫秒 → 退避重试几次即可。不可重试的错误码立即抛出，绝不吞错：
+// 三处调用点（writePage / saveRawPage / saveManifest）原本一次瞬时 EPERM 就会
+// 让 wiki_capture / 页面保存整体抛错丢操作，且看起来像"随机失败"。
+// ---------------------------------------------------------------------------
+const RETRYABLE_RENAME_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+const RENAME_ATTEMPTS = 5
+
+/** 同步退避：Atomics.wait 是 Node 里可用的同步 sleep（不忙等）。 */
+function syncSleep(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+  } catch {
+    // 环境不支持时退化为不等待：重试仍然发生，只是没有退避
+  }
+}
+
+export interface RenameDeps {
+  /** 测试注入点：替换 rename 实现。 */
+  rename?: (from: string, to: string) => void
+  /** 测试注入点：替换退避。 */
+  sleep?: (ms: number) => void
+  /** 最多尝试次数（含首次）。 */
+  attempts?: number
+}
+
+/** rename 的退避重试（原因见上方注释）。 */
+export function renameWithRetry(from: string, to: string, deps: RenameDeps = {}): void {
+  const rename = deps.rename ?? renameSync
+  const sleep = deps.sleep ?? syncSleep
+  const attempts = Math.max(1, deps.attempts ?? RENAME_ATTEMPTS)
+  let lastError: unknown
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      rename(from, to)
+      return
+    } catch (error) {
+      lastError = error
+      const code = (error as NodeJS.ErrnoException | undefined)?.code
+      // 不可重试（如 ENOENT）：不是竞争，重试无意义
+      if (code === undefined || !RETRYABLE_RENAME_CODES.has(code)) throw error
+      if (attempt < attempts) sleep(attempt * 5)
+    }
+  }
+  throw lastError
+}
+
 export class VaultStore implements VaultProvider {
   constructor(private readonly vaultRoot: string) {}
 
@@ -227,7 +282,7 @@ export class VaultStore implements VaultProvider {
     const tmp = file + '.tmp-' + process.pid + '-' + Date.now()
     writeFileSync(tmp, text, 'utf8')
     try {
-      renameSync(tmp, file)
+      renameWithRetry(tmp, file)
     } catch (e) {
       try { rmSync(tmp, { force: true }) } catch { /* best effort */ }
       throw e
@@ -327,7 +382,7 @@ export class VaultStore implements VaultProvider {
     const tmp = file + '.tmp-' + Date.now()
     writeFileSync(tmp, text, 'utf8')
     try {
-      renameSync(tmp, file)
+      renameWithRetry(tmp, file)
     } catch (e) {
       try { rmSync(tmp, { force: true }) } catch { /* best effort */ }
       throw e
@@ -362,7 +417,7 @@ export class VaultStore implements VaultProvider {
     const tmp = file + '.tmp-' + process.pid + '-' + Date.now()
     writeFileSync(tmp, JSON.stringify(m, null, 2), 'utf8')
     try {
-      renameSync(tmp, file)
+      renameWithRetry(tmp, file)
     } catch (e) {
       try { rmSync(tmp, { force: true }) } catch { /* best effort */ }
       throw e

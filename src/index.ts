@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { VaultManager } from './vault-manager.ts'
 import { mountTools } from './tools.ts'
 import { mountWikiRoutes, type WikiHost } from './routes.ts'
+import { installTrigger, type TriggerHost } from './trigger.ts'
 
 export const name = 'dsh-knj-obsidian'
 
@@ -48,9 +49,12 @@ export function apply(ctx: Context, config?: Config): void {
     })
     const disposeTools = mountTools(hostCtx, manager)
     const disposeRoutes = mountWikiRoutes(host, manager)
+    // 任务级知识触发（L1）+ 回合级沉淀提醒（L5）：只读、不阻断，KNJ_OBSIDIAN_TRIGGER=off 可关。
+    const disposeTrigger = installTrigger(hostCtx as unknown as TriggerHost, manager)
     return () => {
       disposeTools()
       disposeRoutes()
+      disposeTrigger()
     }
   })
 }

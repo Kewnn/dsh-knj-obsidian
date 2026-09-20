@@ -45,6 +45,8 @@ export interface RetrievalCandidate {
   score: number
   /** 归一化后的分层（core/supporting/peripheral），即打分所用的权重档位。 */
   tier: WikiTier
+  /** 页面 frontmatter 的 source（原始出处标识）：候选一路带着它，合成答案才追得回源头。 */
+  source: string
 }
 
 export interface RetrievalResult {
@@ -70,6 +72,60 @@ export interface RetrievalOptions {
 
 const MAX_SNIPPET = 200
 
+/**
+ * 查询拆词：按空白与常见分隔符切分（中英文标点都算），只保留非空片段；
+ * **纯 CJK 长片段再按 2 字滑窗拆 bigram**——没有空格的中文句子上面拆不开，2 字滑窗
+ * 是唯一确定性的廉价拆法（「知识库怎么触发检索」→ 知识/识库/库怎/…/检索）。
+ *
+ * 为什么必须拆：改动前整个查询被当成**单一子串**做 `includes` / `indexOf`，于是任何
+ * 词组式写法（「knj-workflow 流程实例 运行 变量」）与任何中文自然语言句子
+ * （「知识库怎么触发检索」）都必然 0 命中——而这两种恰恰是最自然的提问方式。
+ *
+ * 兼容性：单 token 查询返回 `[q]`，占比恒为 1，与改动前**逐字节等价**；
+ * 2 字中文 = 1 个 bigram，同样与整串等价。只有 ≥3 字 CJK 与多 token 查询才走占比加权。
+ */
+export function tokenizeQuery(query: string): string[] {
+  const q = query.trim().toLowerCase()
+  if (!q) return []
+  const parts = q.split(/[\s,，、;；:：|/\\]+/).filter((s) => s.length > 0)
+  const tokens: string[] = []
+  for (const part of parts) {
+    if (isCjkRun(part) && [...part].length >= 3) {
+      const chars = [...part]
+      for (let i = 0; i + 1 < chars.length; i += 1) tokens.push(chars[i] + chars[i + 1])
+      continue
+    }
+    tokens.push(part)
+  }
+  // 去重：避免同一个词在大分母里灌水（bigram 尤甚）
+  const unique = [...new Set(tokens)]
+  return unique.length > 0 ? unique : [q]
+}
+
+/** 纯 CJK 连续串（汉字/假名/谚文；排除 ASCII、数字与标点）。 */
+function isCjkRun(value: string): boolean {
+  return /^[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+$/.test(value)
+}
+
+/** 命中词数 / 总词数（分母恒为查询词数；0 词返回 0）。任一 token 命中即为 > 0，即 OR 语义。 */
+function matchRatio(haystack: string, tokens: readonly string[]): number {
+  if (tokens.length === 0) return 0
+  let matched = 0
+  for (const token of tokens) if (haystack.includes(token)) matched += 1
+  return matched / tokens.length
+}
+
+/** 首个命中 token 在 haystack 中的位置（无命中返回 -1），供 L3 的居中 snippet 使用。 */
+function firstTokenIndex(haystack: string, tokens: readonly string[]): number {
+  let best = -1
+  for (const token of tokens) {
+    const idx = haystack.indexOf(token)
+    if (idx < 0) continue
+    if (best < 0 || idx < best) best = idx
+  }
+  return best
+}
+
 /** 解析 [[wikilink]]：剥离锚点（#…）与别名（|…），与 lint.ts 保持一致 */
 const WIKILINK_RE = /\[\[([^\]|#]+)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]/g
 
@@ -88,6 +144,8 @@ export function retrieve(
   const mode = opts.mode ?? 'auto'
   const maxCandidates = opts.maxCandidates ?? 10
   const q = query.trim().toLowerCase()
+  // 拆词只在多 token 查询上生效；单 token 时 tokens = [q]，占比恒为 1 → 与改动前逐字节等价
+  const tokens = tokenizeQuery(q)
   // 只读列举：检索不得触发 ensure()（零写入，全新 vault 也可直接检索）
   const pages = store.listPagesReadonly()
   const totalPages = pages.length
@@ -95,7 +153,7 @@ export function retrieve(
   if (!q) return { candidates: [], strategy: 'empty-query', totalPages }
 
   if (mode === 'index-only') {
-    return { candidates: indexOnly(store, q, maxCandidates), strategy: 'index-only', totalPages }
+    return { candidates: indexOnly(store, q, tokens, maxCandidates), strategy: 'index-only', totalPages }
   }
 
   // 单次装载：前置层匹配、正文匹配、度计算共用同一份已解析页面（readPage 自带 mtime 缓存）
@@ -114,7 +172,7 @@ export function retrieve(
   const frontHits: RetrievalCandidate[] = []
   let guardTriggered = false
   for (const e of entries) {
-    const m = frontMatch(e, q)
+    const m = frontMatch(e, q, tokens)
     if (!m) continue
     if (m.guards) guardTriggered = true
     frontHits.push(candidate(e, m.layer, m.base, degree))
@@ -136,11 +194,12 @@ export function retrieve(
   const summaryHits: RetrievalCandidate[] = []
   for (const e of entries) {
     if (frontIds.has(e.id)) continue
-    if (e.page.body.toLowerCase().includes(q)) continue // 正文能命中：交给正文层，别抢标签
+    if (matchRatio(e.page.body.toLowerCase(), tokens) > 0) continue // 正文能命中：交给正文层，别抢标签
     const summary = e.page.summary ?? ''
-    if (!summary.toLowerCase().includes(q)) continue
+    const ratio = matchRatio(summary.toLowerCase(), tokens)
+    if (ratio <= 0) continue
     // snippet 同样受 MAX_SNIPPET 约束：摘要是外部输入，长度不受控
-    summaryHits.push(candidate(e, 'summary', MATCH_SCORE.summary, degree, summary.slice(0, MAX_SNIPPET)))
+    summaryHits.push(candidate(e, 'summary', MATCH_SCORE.summary * ratio, degree, summary.slice(0, MAX_SNIPPET)))
   }
 
   // 成本护栏（既有契约，retriever.test.mjs 断言 strategy === 'title+tag'）：前置层出现
@@ -160,8 +219,9 @@ export function retrieve(
   // dsh-agent-orchestration 被一并丢掉）。重复候选由下面的融合去重处理。
   const bodyHits: RetrievalCandidate[] = []
   for (const e of entries) {
-    const idx = e.page.body.toLowerCase().indexOf(q)
-    if (idx !== -1) bodyHits.push(candidate(e, 'body', MATCH_SCORE.body, degree, undefined, idx))
+    const body = e.page.body.toLowerCase()
+    const ratio = matchRatio(body, tokens)
+    if (ratio > 0) bodyHits.push(candidate(e, 'body', MATCH_SCORE.body * ratio, degree, undefined, firstTokenIndex(body, tokens)))
   }
 
   // L4：对 L3 命中的每个页面，取其出链邻居作为关联候选（matchedBy: 'graph'）
@@ -220,17 +280,20 @@ interface FrontMatch {
  * 前置层匹配（标题 / 标签，均无需读正文）。
  * 与上游一致：一个查询对一页只取**最高**的那一档，不叠加（上游同样是 if/elif 链）。
  */
-function frontMatch(e: PageEntry, q: string): FrontMatch | null {
+function frontMatch(e: PageEntry, q: string, tokens: readonly string[]): FrontMatch | null {
   const title = e.page.title.toLowerCase()
-  if (title.includes(q)) {
+  const titleRatio = matchRatio(title, tokens)
+  if (titleRatio > 0) {
     // 精确命中（id 或标题与查询词完全相等）拿最高基础分；这是同一档内的分数细化，
     // 不改变「谁命中前置层」这件事。
     const exact = e.id.toLowerCase() === q || title === q
-    return { layer: 'title', base: exact ? MATCH_SCORE.exactTitle : MATCH_SCORE.title, guards: true }
+    const base = (exact ? MATCH_SCORE.exactTitle : MATCH_SCORE.title) * titleRatio
+    // 护栏只认「全部词命中」：多词查询只命中一个词时不该停手，否则弱前置命中会截断正文层与 L4。
+    // 单 token 查询命中即占比 1 → guards 仍为 true，护栏契约与改动前一致。
+    return { layer: 'title', base, guards: titleRatio === 1 }
   }
-  if (e.page.tags.some((t) => t.toLowerCase().includes(q))) {
-    return { layer: 'tag', base: MATCH_SCORE.tag, guards: true }
-  }
+  const tagRatio = e.page.tags.reduce((max, t) => Math.max(max, matchRatio(t.toLowerCase(), tokens)), 0)
+  if (tagRatio > 0) return { layer: 'tag', base: MATCH_SCORE.tag * tagRatio, guards: tagRatio === 1 }
   // id 精确相等但标题不含查询词：产生候选并给最高分，但**不**触发护栏（见 guards 说明）。
   if (e.id.toLowerCase() === q) return { layer: 'title', base: MATCH_SCORE.exactTitle, guards: false }
   return null
@@ -300,7 +363,7 @@ function semanticCandidates(
  * 因此这里不做度加权（度为 0），分数只由基础分 × tier 权重构成；也刻意**不重排**——
  * index.md 的顺序是人工维护的目录顺序，比常量分排序更有信息量（见 spec 的「可牺牲」项）。
  */
-function indexOnly(store: VaultStore, q: string, max: number): RetrievalCandidate[] {
+function indexOnly(store: VaultStore, q: string, tokens: readonly string[], max: number): RetrievalCandidate[] {
   const out: RetrievalCandidate[] = []
   const noDegree = new Map<string, number>()
   const indexPath = join(store.wikiRoot, 'index.md')
@@ -308,7 +371,7 @@ function indexOnly(store: VaultStore, q: string, max: number): RetrievalCandidat
     const lines = readFileSync(indexPath, 'utf8').replace(/\r\n/g, '\n').split('\n')
     for (const line of lines) {
       const m = line.match(/\[\[([^\]|#]+)(?:\|[^\]]*)?\]\]/)
-      if (m && line.toLowerCase().includes(q)) {
+      if (m && matchRatio(line.toLowerCase(), tokens) > 0) {
         const id = m[1].trim()
         let page: WikiPage | null = null
         for (const cat of RETRIEVAL_CATEGORIES) {
@@ -346,6 +409,7 @@ function candidate(
     matchedBy,
     score: scoreOf(base, degree.get(e.id) ?? 0, tier),
     tier,
+    source: e.page.source,
   }
 }
 

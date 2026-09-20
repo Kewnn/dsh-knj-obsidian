@@ -147,3 +147,125 @@ test('linkedPages 返回页面出链 target 列表', (t) => {
   const links = linkedPages(store, 'a', 'concepts')
   assert.deepEqual(links.sort(), ['b', 'c', 'd'])
 })
+
+// ---------------------------------------------------------------------------
+// 2026-09-20 检索闭环修复：多词查询拆词命中 + 候选透传 source
+// 实测背景：整串子串匹配下，「knj-workflow 流程实例 运行 变量」这类多词查询
+// 在 12 个会话里被反复重试且全部返回「wiki 无匹配」——查询是自然的词组式写法，
+// 恰好是整串匹配命中率最低的写法。
+// ---------------------------------------------------------------------------
+
+test('多词查询拆词命中：整串子串不成立时仍能召回（占比加权）', (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const now = '2026-08-25T00:00:00.000Z'
+  const body = 'dsh-scheduler 的 cron 表达式按 UTC 解释；定时任务在当地时间早上九点没触发，用户以为坏了。'
+  store.writePage({ id: 'cron-utc', title: '定时任务时区被强制成 UTC', category: 'concepts', tags: ['cron', 'pitfall'], source: 'agent:session-2026-08-27', confidence: 'extracted', created: now, updated: now, body })
+
+  const query = '定时任务 没触发'
+  // 前提自检：整串子串语义下这个查询不可能命中（标题/标签/正文都不含该连续串）——
+  // 保证下面的召回确实来自「拆词」，而不是碰巧的整串命中。
+  assert.ok(!body.toLowerCase().includes(query), '正文不含整串查询')
+  assert.ok(!'定时任务时区被强制成 UTC'.toLowerCase().includes(query), '标题不含整串查询')
+
+  const r = retrieve(store, query)
+  const hit = r.candidates.find((c) => c.id === 'cron-utc')
+  assert.ok(hit, '含部分查询词的页面必须被召回')
+  // 2026-09-20：CJK 串按 2 字滑窗拆 bigram 后，本查询的词表是
+  //   定时任务 → 定时/时任/任务 ； 没触发 → 没触/触发
+  // 标题「定时任务时区被强制成 UTC」命中 定时/时任/任务 = 3/5 → 基础分 6 × 0.6 = 3.6
+  // （度 0、tier 默认 supporting 1.0）。占比含义没变，只是分母改由 bigram 组成。
+  assert.equal(hit.matchedBy, 'title')
+  // 浮点：3/5 不是精确二进制小数，实测 3.5999999999999996 —— 用容差断言
+  assert.ok(Math.abs(hit.score - 3.6) < 1e-9, `多词命中按命中词占比加权（实际 ${hit.score}）`)
+})
+
+test('多词查询：命中全部词时拿到完整基础分（单 token 与多 token 同一套公式）', (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const now = '2026-08-25T00:00:00.000Z'
+  store.writePage({ id: 'all-words', title: '时区 定时任务', category: 'concepts', tags: [], source: 's', confidence: 'extracted', created: now, updated: now, body: '正文无关。' })
+
+  // 词序与标题不同 → 不是「标题全等」，因此走 title 档（6）而非 exactTitle 档（10）：
+  // 这样才真的在测「全词命中 → 占比 1 → 完整基础分」。
+  const r = retrieve(store, '定时任务 时区')
+  const hit = r.candidates.find((c) => c.id === 'all-words')
+  assert.ok(hit)
+  assert.equal(hit.score, 6, '两个词都命中标题 → 6 × 1.0（词序不同，故不吃 exactTitle 的 10）')
+  assert.equal(r.strategy, 'title+tag', '全部词命中前置层 → 护栏照常触发')
+})
+
+test('单 token 查询行为逐字节不变（拆词不得改变既有契约）', (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  seed(store)
+  // 标题命中：'rate' 落在标题「Rate Limiting 踩坑」里 → base 6（非精确：标题≠查询）
+  const byTitle = retrieve(store, 'rate')
+  assert.equal(byTitle.strategy, 'title+tag', '前置层命中即停的护栏契约不变')
+  const t1 = byTitle.candidates.find((c) => c.id === 'rate-limiting')
+  assert.equal(t1.matchedBy, 'title')
+  assert.equal(t1.score, 6, '标题 6 × tier(supporting 1.0) + 度 0，与改动前一致')
+
+  // 标签命中：'rate-limiting' 是标签（标题里是空格写法）→ base 4，护栏同样触发
+  const byTag = retrieve(store, 'rate-limiting')
+  assert.equal(byTag.strategy, 'title+tag')
+  const t2 = byTag.candidates.find((c) => c.id === 'rate-limiting')
+  assert.equal(t2.matchedBy, 'tag')
+  assert.equal(t2.score, 4, '标签 4 × tier(supporting 1.0) + 度 0，与改动前一致')
+})
+
+test('候选透传 source：合成答案可追溯到原始出处', (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const now = '2026-08-25T00:00:00.000Z'
+  store.writePage({ id: 'trace-me', title: '可追溯页', category: 'references', tags: [], source: 'agent:session-2026-09-19-abc', confidence: 'extracted', created: now, updated: now, body: '唯一术语 zzzmarker 出现在这里。' })
+
+  const hit = retrieve(store, 'zzzmarker').candidates.find((c) => c.id === 'trace-me')
+  assert.ok(hit, '正文命中应有候选')
+  assert.equal(hit.source, 'agent:session-2026-09-19-abc', '候选必须带 source（原始出处链不得断在第一环）')
+})
+
+// ---------------------------------------------------------------------------
+// 2026-09-20 第二轮：中文无空格问句。
+// 实测背景：分词只按空白/标点切分，对**没有空格的中文句子等于没拆**——
+// 「知识库怎么触发检索」「怎么避免定时器在错误的时钟下工作」在词面层都是 0 命中，
+// 而这两种写法恰恰是用户提任务时的天然写法（任务级提醒要拿它做匹配，必须先补上）。
+// 修法：CJK 连续串按 2 字滑窗拆 bigram（确定性、零依赖）。只增加召回，
+// 2 字中文（=1 个 bigram，与整串等价）与英文/含空格查询的行为不变。
+// ---------------------------------------------------------------------------
+
+test('中文无空格问句：bigram 拆词后可召回（此前词面层必然 0 命中）', (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const now = '2026-08-25T00:00:00.000Z'
+  store.writePage({ id: 'wiki-trigger', title: '知识库检索触发层', category: 'projects', tags: ['dsh'], source: 'agent:s', confidence: 'extracted', created: now, updated: now, body: '任务级提醒与索引优先策略。' })
+
+  const query = '知识库怎么触发检索'
+  // 前提自检：整串既不在标题里、也不在正文里 → 命中只能来自拆词
+  assert.ok(!'知识库检索触发层'.includes(query), '标题不含整串查询')
+  assert.ok(!'任务级提醒与索引优先策略。'.includes(query), '正文不含整串查询')
+
+  const hit = retrieve(store, query).candidates.find((c) => c.id === 'wiki-trigger')
+  assert.ok(hit, '中文问句必须能召回相关页（bigram 拆词）')
+  assert.ok(hit.score > 0)
+})
+
+test('中文 bigram 不改变短查询与英文查询的既有行为', (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const now = '2026-08-25T00:00:00.000Z'
+  store.writePage({ id: 'rate-limiting', title: 'Rate Limiting 踩坑', category: 'concepts', tags: ['rate-limiting', '限流'], source: 's', confidence: 'extracted', created: now, updated: now, body: '429 处理要指数退避。' })
+
+  // 2 字中文 = 1 个 bigram，与整串等价 → 标签档 base 4，护栏照常触发
+  const two = retrieve(store, '限流')
+  const h1 = two.candidates.find((c) => c.id === 'rate-limiting')
+  assert.equal(h1.matchedBy, 'tag')
+  assert.equal(h1.score, 4, '2 字中文查询与改动前一致')
+  assert.equal(two.strategy, 'title+tag')
+
+  // 英文单 token 不受影响
+  const ascii = retrieve(store, 'rate')
+  const h2 = ascii.candidates.find((c) => c.id === 'rate-limiting')
+  assert.equal(h2.matchedBy, 'title')
+  assert.equal(h2.score, 6)
+})

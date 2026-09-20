@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { VaultStore } from './lib/vault-store.js'
 import { mountTools } from './lib/tools.js'
@@ -15,6 +15,10 @@ const EXEC = { deferContext() {}, concludeTurn() {} }
 // wiki_ingest 现在会安排一次语义索引的后台刷新（真实库冷启动约 1.5 分钟）。
 // 测试里关掉自动刷新：既避免真后台定时器，也不去碰用户真实的 ~/.dsh/qmd。
 process.env.KNJ_OBSIDIAN_AUTO_REFRESH = 'off'
+
+// 未命中日志（<DSH_HOME>/knj-obsidian/query-misses.jsonl）隔离到临时 home：
+// 否则本文件里 wiki_query 的零候选用例会写进用户真实状态，污染"库缺什么"的数据集。
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-obsidian-tools-home-'))
 
 // 成功路径返回值里有两类与本测试关注点无关的字段：
 //   - checkpointId：动态时间戳 → 单独校验形态；
@@ -416,4 +420,181 @@ test('wiki_mine kind=db 对账：同哈希→unchanged，改哈希→changed', a
   }
   const third = await def.execute({ kind: 'db' }, EXEC)
   assert.equal(third.dbChanged.length, first.tables.length, '哈希不一致应为 dbChanged')
+})
+
+// ---------------------------------------------------------------------------
+// 2026-09-20：wiki_query 接上语义兜底。
+// 背景：语义融合管道早已建成（semantic-index.ts 的运行时 + semantic.ts 的 retrieveWithSemantic），
+// 但 retrieveWithSemantic 全源码 0 调用方；wiki_query 只调纯词面 retrieve()，语义层要由 agent
+// 手动另调 wiki_search_semantic 并自行合并——实测 2.5 周 415 个会话里它只被调用过 1 次。
+// 本组用例锁住三件事：兜底接线、阈值（词面够多就不调）、不可用时的静默降级。
+// ---------------------------------------------------------------------------
+
+/** 假语义运行时：让接线行为可断言，且不触碰真实 ~/.dsh/qmd 与 300M 模型。 */
+function fakeSemanticRuntime(overrides = {}) {
+  return {
+    status: 'ready',
+    modelPath: 'fake-model.gguf',
+    modelPresent: true,
+    index: { documents: 3, pendingEmbedding: 0, hasVectorIndex: true },
+    store: {
+      searchVector: async () => [{ displayPath: 'concepts/rate-limiting.md' }],
+      searchLex: async () => [],
+      getStatus: () => ({ totalDocuments: 3, needsEmbedding: 0, hasVectorIndex: true }),
+      update: async () => ({}),
+      embed: async () => ({}),
+      close: () => {},
+    },
+    ...overrides,
+  }
+}
+
+function mountWithSemantic(store, dir, factory) {
+  const registered = []
+  mountTools(
+    { tools: { register: (def) => registered.push(def) } },
+    { current: () => store, currentRecord: () => ({ root: dir }) },
+    { semanticRuntimeFactory: factory },
+  )
+  return registered.find((d) => d.name === 'wiki_query')
+}
+
+test('wiki_query：词面候选 < 2 时自动带语义兜底（接线断言，注入假 runtime）', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  store.writePage({ id: 'rate-limiting', title: 'Rate Limiting 踩坑', category: 'concepts', tags: [], source: 'agent:session-x', confidence: 'extracted', created: 'c', updated: 'u', body: '429 要指数退避。' })
+
+  const calls = []
+  const def = mountWithSemantic(store, dir, async (vaultRoot) => { calls.push(vaultRoot); return fakeSemanticRuntime() })
+
+  const res = await def.execute({ query: '词组式查询 但词面不存在' }, EXEC)
+  assert.equal(calls.length, 1, '词面几乎无果时必须调用一次语义运行时')
+  assert.equal(calls[0], dir, '运行时按当前库构造')
+  const hit = res.candidates.find((c) => c.id === 'rate-limiting')
+  assert.ok(hit, '语义命中必须出现在候选里')
+  assert.equal(hit.matchedBy, 'semantic')
+  assert.match(res.strategy, /semantic/)
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, res), [])
+})
+
+test('wiki_query：词面候选足够时不得调用语义层（省算力），且候选透传 source', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  store.writePage({ id: 'rate-limiting', title: 'Rate Limiting 踩坑', category: 'concepts', tags: ['rate-limiting', 'api'], source: 'agent:session-x', confidence: 'extracted', created: 'c', updated: 'u', body: '429 要指数退避。' })
+  store.writePage({ id: 'stale-closure', title: 'React Stale Closure', category: 'concepts', tags: ['rate-limiting'], source: 'agent:session-y', confidence: 'extracted', created: 'c', updated: 'u', body: '闭包捕获旧值。' })
+
+  let called = 0
+  const def = mountWithSemantic(store, dir, async () => { called += 1; return fakeSemanticRuntime() })
+
+  const res = await def.execute({ query: 'rate-limiting' }, EXEC)
+  assert.ok(res.candidates.length >= 2, '前置层/标签层应给出 >= 2 条候选')
+  assert.equal(called, 0, '词面候选足够时不得触碰语义运行时')
+  assert.ok(!res.strategy.includes('semantic'))
+  for (const c of res.candidates) {
+    assert.equal(typeof c.source, 'string')
+    assert.ok(c.source.length > 0, '每条候选都必须带 source')
+  }
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, res), [])
+})
+
+test('wiki_query：语义运行时不可用/抛错时静默降级为纯词面（不抛错、不假装命中）', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  store.writePage({ id: 'rate-limiting', title: 'Rate Limiting 踩坑', category: 'concepts', tags: [], source: 's', confidence: 'extracted', created: 'c', updated: 'u', body: '429 要指数退避。' })
+
+  const notReady = mountWithSemantic(store, dir, async () => fakeSemanticRuntime({ status: 'index-empty', modelPresent: false, store: null }))
+  const res1 = await notReady.execute({ query: '词面不存在 的查询' }, EXEC)
+  assert.deepEqual(res1.candidates, [], '模型缺失时不得凭空造候选')
+  assert.ok(!res1.strategy.includes('semantic'))
+
+  const throwing = mountWithSemantic(store, dir, async () => { throw new Error('qmd 加载失败') })
+  const res2 = await throwing.execute({ query: '词面不存在 的查询' }, EXEC)
+  assert.deepEqual(res2.candidates, [], '语义层抛错必须被吞掉，不得让 wiki_query 报错')
+  assert.ok(!res2.strategy.includes('semantic'))
+})
+
+// 这条守住一个实测踩到的坑：语义兜底一旦在单测里生效，就会加载真实 300M 模型
+// （wiki-query-tool.test.mjs 里那条「全新 vault 零写入」由 <1s 变成 26.8s，并把测试报告流冲坏、
+// 导致同文件两条用例不被计入）。开关必须能在不改代码的前提下关掉兜底。
+test('语义兜底开关 KNJ_OBSIDIAN_SEMANTIC_FALLBACK=off 时不得触碰语义运行时', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  store.writePage({ id: 'rate-limiting', title: 'Rate Limiting 踩坑', category: 'concepts', tags: [], source: 's', confidence: 'extracted', created: 'c', updated: 'u', body: '429 要指数退避。' })
+
+  const saved = process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK
+  process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK = 'off'
+  t.after(() => {
+    if (saved === undefined) delete process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK
+    else process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK = saved
+  })
+
+  let called = 0
+  const def = mountWithSemantic(store, dir, async () => { called += 1; return fakeSemanticRuntime() })
+  const res = await def.execute({ query: '词面不存在 的查询' }, EXEC)
+  assert.equal(called, 0, '开关为 off 时必须完全跳过语义运行时（不得加载模型）')
+  assert.deepEqual(res.candidates, [])
+  assert.ok(!res.strategy.includes('semantic'))
+})
+
+// ---------------------------------------------------------------------------
+// 2026-09-20：检索未命中日志的**接线**验证。
+// 上面 miss-log.test.mjs 只测了 recordQueryMiss 本身；本组测的是 wiki_query 真的会调它，
+// 且不会因此往 vault 里写东西（"检索只读"是公开契约）。
+// ---------------------------------------------------------------------------
+
+test('wiki_query 零候选时记一条未命中（诊断埋点）；有候选不记；且不写进 vault', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const home = mkdtempSync(join(tmpdir(), 'dsh-misslog-home-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const savedHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  t.after(() => {
+    if (savedHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = savedHome
+  })
+
+  store.writePage({ id: 'rate-limiting', title: 'Rate Limiting 踩坑', category: 'concepts', tags: ['api'], source: 's', confidence: 'extracted', created: 'c', updated: 'u', body: '429 要指数退避。' })
+  // 注入不可用的语义运行时：避免单测里加载真实 300M 模型（它现在是语义兜底路径的默认工厂）
+  const def = mountWithSemantic(store, dir, async () => fakeSemanticRuntime({ status: 'index-empty', modelPresent: false, store: null }))
+
+  const vaultBefore = JSON.stringify([...store.listPagesReadonly()].map((p) => p.id))
+  const missRes = await def.execute({ query: '完全无关的查询 zzzqqq' }, EXEC)
+  assert.deepEqual(missRes.candidates, [])
+
+  const logFile = join(home, 'knj-obsidian', 'query-misses.jsonl')
+  assert.ok(existsSync(logFile), '零候选必须留下一条未命中记录（否则无法回答"库缺什么"）')
+  const entries = readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].query, '完全无关的查询 zzzqqq')
+  assert.equal(entries[0].workspace, basename(dir), '按工作区区分，才能对比"哪个工作区缺货"')
+  assert.equal(entries[0].mode, 'auto')
+  assert.equal(entries[0].semanticTried, true, '记录了"试过语义兜底还是没有"')
+
+  // 有候选 → 不记
+  const hitRes = await def.execute({ query: 'rate-limiting' }, EXEC)
+  assert.ok(hitRes.candidates.length > 0)
+  assert.equal(readFileSync(logFile, 'utf8').split('\n').filter(Boolean).length, 1, '有候选不得记')
+
+  // 不写进 vault（检索只读契约）
+  assert.equal(JSON.stringify([...store.listPagesReadonly()].map((p) => p.id)), vaultBefore)
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, hitRes), [])
+})
+
+test('wiki_query：KNJ_OBSIDIAN_MISS_LOG=off 时不记未命中', async (t) => {
+  const { dir, store } = makeVault()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const home = mkdtempSync(join(tmpdir(), 'dsh-misslog-off-'))
+  t.after(() => rmSync(home, { recursive: true, force: true }))
+  const saved = { home: process.env.DSH_HOME, off: process.env.KNJ_OBSIDIAN_MISS_LOG }
+  process.env.DSH_HOME = home
+  process.env.KNJ_OBSIDIAN_MISS_LOG = 'off'
+  t.after(() => {
+    if (saved.home === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = saved.home
+    if (saved.off === undefined) delete process.env.KNJ_OBSIDIAN_MISS_LOG; else process.env.KNJ_OBSIDIAN_MISS_LOG = saved.off
+  })
+
+  const def = mountWithSemantic(store, dir, async () => fakeSemanticRuntime({ status: 'index-empty', modelPresent: false, store: null }))
+  await def.execute({ query: '完全无关的查询 zzzqqq' }, EXEC)
+  assert.equal(existsSync(join(home, 'knj-obsidian', 'query-misses.jsonl')), false, '开关关闭时不得写日志')
 })

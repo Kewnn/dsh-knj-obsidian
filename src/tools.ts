@@ -6,9 +6,11 @@ import type { VaultProvider } from './types.ts'
 import type { WikiCategory, WikiTier, Confidence, WikiPage } from './types.ts'
 import { lintVault, auditTags } from './lint.ts'
 import { loadTaxonomy, SYSTEM_TAG_PREFIX } from './taxonomy.ts'
-import { retrieve } from './retriever.ts'
+import { retrieve, RETRIEVAL_CATEGORIES } from './retriever.ts'
+import type { SemanticPageHit } from './retriever.ts'
+import { recordQueryMiss, missLogEnabled } from './miss-log.ts'
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { buildGraph, exportGraphHtml } from './graph-engine.ts'
 import { mineEnums, mineTables } from './code-miner.ts'
 import { readProgress, markModule, pendingModules, progressFileFor } from './mining-progress.ts'
@@ -17,6 +19,7 @@ import { createCheckpoint, listCheckpoints } from './checkpoint.ts'
 import { rebuildIndex } from './index-builder.ts'
 import {
   createSemanticRuntime, clampLimit, runOfflineSearch, notReadyMessage, resolveStateHome, DEFAULT_MODEL_FILENAME,
+  type SemanticHit, type SemanticRuntime,
 } from './semantic-index.ts'
 import { refresherFor, vaultRootOf } from './semantic-refresh.ts'
 
@@ -141,7 +144,108 @@ function currentReadonlyStore(provider: VaultProvider): VaultStore {
   return provider.current() as VaultStore
 }
 
-export function mountTools(ctx: Context, provider: VaultProvider): () => void {
+/** wiki_query 的语义兜底阈值：词面候选少于该数时才启用语义层（省算力——嵌入调用只在词面几乎无果时发生）。 */
+export const SEMANTIC_FALLBACK_MIN_CANDIDATES = 2
+
+export interface MountToolsOptions {
+  /** 测试注入点：替换语义运行时创建（默认按当前库创建进程内 QMD 运行时）。 */
+  semanticRuntimeFactory?: (vaultRoot: string) => Promise<SemanticRuntime>
+}
+
+/** 语义命中 → retriever 的 SemanticPageHit（分类白名单在这里与 retriever 内部各校验一次）。 */
+function toSemanticPageHits(results: readonly SemanticHit[]): SemanticPageHit[] {
+  const out: SemanticPageHit[] = []
+  for (const r of results) {
+    if (!RETRIEVAL_CATEGORIES.includes(r.category as WikiCategory)) continue
+    out.push({ id: r.id, category: r.category as WikiCategory, ...(r.snippet ? { snippet: r.snippet } : {}) })
+  }
+  return out
+}
+
+// ---------- 按库缓存语义运行时（与 refresherFor 同惯例：模块级注册表 + 全局 dispose） ----------
+//
+// 为什么缓存：语义运行时一开就要加载本地 300M 嵌入模型，而兜底恰好发生在「多词查询」这种会
+// 反复出现的场景里；每次重建会把模型加载成本重复付一遍。创建失败不缓存（下次可重试）。
+const semanticRuntimes = new Map<string, Promise<SemanticRuntime | null>>()
+
+/**
+ * 语义兜底开关：`KNJ_OBSIDIAN_SEMANTIC_FALLBACK=off` 时完全关闭。
+ * 与 `KNJ_OBSIDIAN_AUTO_REFRESH=off` 同族：单元测试与离线环境用它避免加载 300M 嵌入模型、
+ * 不去碰用户真实的 ~/.dsh/qmd（模型冷启动一次就要几十秒，测试里不可接受）。
+ */
+export function semanticFallbackEnabled(): boolean {
+  return (process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK ?? '').trim().toLowerCase() !== 'off'
+}
+
+function semanticRuntimeFor(
+  vaultRoot: string,
+  factory: (root: string) => Promise<SemanticRuntime>,
+): Promise<SemanticRuntime | null> {
+  const cached = semanticRuntimes.get(vaultRoot)
+  if (cached) return cached
+  const created = factory(vaultRoot).catch(() => null)
+  semanticRuntimes.set(vaultRoot, created)
+  return created
+}
+
+/** 关闭并清空所有缓存的语义运行时（插件 dispose 时调用，避免 sqlite 句柄与模型常驻）。 */
+export function disposeSemanticRuntimes(): void {
+  for (const pending of semanticRuntimes.values()) {
+    void pending.then((runtime) => { try { runtime?.store?.close?.() } catch { /* 关闭失败不影响退出 */ } })
+  }
+  semanticRuntimes.clear()
+}
+
+export function mountTools(ctx: Context, provider: VaultProvider, opts: MountToolsOptions = {}): () => void {
+  const runtimeFactory = opts.semanticRuntimeFactory ?? ((root: string) => createSemanticRuntime({ vaultRoot: root }))
+
+  /**
+   * 零候选时记一条未命中（诊断用）。**绝不影响检索结果**：只读、失败静默、开关可关。
+   * 这是「库缺什么」的原始数据来源，也是命中率的原生埋点。
+   */
+  function recordMissIfEmpty(
+    result: { candidates: readonly unknown[]; totalPages: number },
+    query: string,
+    mode: string,
+    semanticTried: boolean,
+  ): void {
+    if (result.candidates.length > 0 || !missLogEnabled()) return
+    try {
+      const vaultRoot = provider.currentRecord()?.root ?? vaultRootOf(currentReadonlyStore(provider))
+      recordQueryMiss({
+        at: new Date().toISOString(),
+        vaultRoot,
+        workspace: basename(vaultRoot),
+        query,
+        mode,
+        totalPages: result.totalPages,
+        semanticTried,
+      })
+    } catch {
+      // 诊断日志绝不打断检索
+    }
+  }
+
+  /**
+   * wiki_query 的语义兜底：词面几乎无果时调一次语义运行时，把命中交给 retrieve() 融合。
+   * 任何不可用/失败（模型缺失、库缺失、索引为空、后端抛错）都返回空数组 → 调用方保持纯词面结果，
+   * 绝不抛错、不联网、不建索引。
+   */
+  async function semanticFallbackHits(query: string, limit: number): Promise<SemanticPageHit[]> {
+    if (!semanticFallbackEnabled()) return []
+    const store = currentReadonlyStore(provider)
+    const vaultRoot = provider.currentRecord()?.root ?? vaultRootOf(store)
+    const runtime = await semanticRuntimeFor(vaultRoot, runtimeFactory)
+    if (!runtime?.store) return []
+    if (runtime.status === 'index-empty') return []
+    try {
+      const outcome = await runOfflineSearch(runtime.store, query, limit)
+      return toSemanticPageHits(outcome.results)
+    } catch {
+      return []
+    }
+  }
+
   ctx.tools.register(defineTool({
     name: 'wiki_ingest',
     description: '把 agent 提取好的知识页写入项目 wiki（.wiki/）。入参 pages 为页面数组；source 为源材料标识。同一 source 重新导入时覆盖更新（保留 frontmatter 的 created，更新 updated）；库内已有同 id 页面但来自不同 source 时不覆盖，自动加 -2/-3 后缀新建（防止跨源静默丢失旧内容）。传入 contentHash（源内容 SHA-256）且与 manifest 记录一致时整体跳过本次 ingest。',
@@ -655,6 +759,7 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
                 matchedBy: { type: 'string', required: true },
                 score: { type: 'number', required: true },
                 tier: { type: 'string', required: true },
+                source: { type: 'string', required: true },
               },
             },
           },
@@ -668,10 +773,25 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
         : [{ type: 'text', text: `检索到 ${value.candidates.length} 条候选（${value.strategy}${args.mode === 'index-only' ? '，按 index.md 目录顺序' : '，按分降序'}）：${value.candidates.map((c) => `${c.id}(${c.score.toFixed(1)})`).join('、')}` }],
     },
     async execute(args) {
-      return retrieve(currentReadonlyStore(provider), args.query, {
-        mode: args.mode === 'index-only' ? 'index-only' : 'auto',
-        maxCandidates: args.maxCandidates ?? 10,
-      })
+      const store = currentReadonlyStore(provider)
+      const mode = args.mode === 'index-only' ? 'index-only' : 'auto'
+      const maxCandidates = args.maxCandidates ?? 10
+      const wordFace = retrieve(store, args.query, { mode, maxCandidates })
+      // index-only 是「只读 index.md」的快速路径契约，不掺语义层；
+      // 词面候选够多时也不打扰语义层（嵌入调用只在词面几乎无果时发生）。
+      if (mode === 'index-only' || wordFace.candidates.length >= SEMANTIC_FALLBACK_MIN_CANDIDATES) {
+        recordMissIfEmpty(wordFace, args.query, mode, false)
+        return wordFace
+      }
+      const semanticHits = await semanticFallbackHits(args.query, maxCandidates)
+      const semanticTried = semanticFallbackEnabled()
+      if (semanticHits.length === 0) {
+        recordMissIfEmpty(wordFace, args.query, mode, semanticTried)
+        return wordFace
+      }
+      const merged = retrieve(store, args.query, { mode, maxCandidates, semanticHits })
+      recordMissIfEmpty(merged, args.query, mode, semanticTried)
+      return merged
     },
   }))
 
@@ -1097,5 +1217,5 @@ export function mountTools(ctx: Context, provider: VaultProvider): () => void {
     },
   }))
 
-  return () => {}
+  return () => { disposeSemanticRuntimes() }
 }

@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, utimesSyn
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { VaultStore } from './lib/vault-store.js'
+import { renameWithRetry } from './lib/vault-store.js'
 
 function makeVault() {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-obsidian-vault-'))
@@ -199,4 +200,67 @@ test('readPage 反映磁盘外部编辑（mtime 失效：缓存不得返回旧�
   assert.ok(back)
   assert.equal(back.title, '新标题', '外部编辑后必须读到新内容')
   assert.equal(back.body, '新正文')
+})
+
+// ---------------------------------------------------------------------------
+// 2026-09-20：Windows 上 tmp+rename 的瞬时 EPERM。
+//
+// 实测证据：全量并发跑测试时偶发（隔离跑 40 次全绿、全量第 1 次即复现）
+//   EPERM: operation not permitted, rename '<…>.manifest.json.tmp-…' -> '.manifest.json'
+//   at VaultStore.saveManifest → updateManifest
+// 成因：目标是「刚创建的文件」，会被测试进程之外的东西瞬时持有句柄（Defender/索引器扫描），
+// Windows 上 rename 覆盖已存在且被打开的文件就会 EPERM；Linux 的 rename 不会这样。
+//
+// 危害不止测试：writePage / saveRawPage / saveManifest 三处同样无重试——
+// 生产里一次瞬时 EPERM 会让 wiki_capture / 页面保存直接抛错、那次操作丢失，
+// 且看起来像"随机失败"。修法：可重试错误码 + 退避重试。
+// ---------------------------------------------------------------------------
+
+function errnoError(code) {
+  const err = new Error(`${code}: mock rename failure`)
+  err.code = code
+  return err
+}
+
+test('renameWithRetry：可重试错误码退避重试后成功（模拟外部句柄瞬时占用）', () => {
+  const sleeps = []
+  let attempt = 0
+  renameWithRetry('a', 'b', {
+    attempts: 5,
+    sleep: (ms) => sleeps.push(ms),
+    rename: () => {
+      attempt += 1
+      if (attempt < 3) throw errnoError('EPERM')
+    },
+  })
+  assert.equal(attempt, 3, '前两次 EPERM 应被重试')
+  assert.deepEqual(sleeps, [5, 10], '退避应递增')
+})
+
+test('renameWithRetry：一直失败则抛原错误（不吞错、不无限重试）', () => {
+  let attempt = 0
+  assert.throws(
+    () => renameWithRetry('a', 'b', {
+      attempts: 3,
+      sleep: () => {},
+      rename: () => { attempt += 1; throw errnoError('EPERM') },
+    }),
+    (e) => e.code === 'EPERM',
+  )
+  assert.equal(attempt, 3, '重试次数必须封顶')
+})
+
+test('renameWithRetry：不可重试的错误码立即抛出（不做无意义退避）', () => {
+  const sleeps = []
+  let attempt = 0
+  assert.throws(
+    () => renameWithRetry('a', 'b', {
+      attempts: 5,
+      sleep: (ms) => sleeps.push(ms),
+      rename: () => { attempt += 1; throw errnoError('ENOENT') },
+    }),
+    (e) => e.code === 'ENOENT',
+  )
+  assert.equal(attempt, 1, 'ENOENT 不是竞争，重试无意义')
+  assert.deepEqual(sleeps, [])
 })

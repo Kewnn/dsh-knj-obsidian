@@ -14,6 +14,12 @@ import { join } from 'node:path'
 import { VaultStore } from './lib/vault-store.js'
 import { retrieve } from './lib/retriever.js'
 import { rebuildIndex } from './lib/index-builder.js'
+
+// 本文件会执行 wiki_query：关掉语义兜底，避免单元测试加载真实 300M 嵌入模型、
+// 去碰用户真实的 ~/.dsh/qmd（与 tools.test.mjs 关自动刷新同策略）。
+process.env.KNJ_OBSIDIAN_SEMANTIC_FALLBACK = 'off'
+// 未命中日志同样隔离到临时 home（否则测试的零候选查询会污染真实 miss 日志）
+process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-obsidian-srhome-'))
 import { mountTools } from './lib/tools.js'
 
 const NOW = '2026-09-20T00:00:00.000Z'
