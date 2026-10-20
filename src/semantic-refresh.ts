@@ -67,6 +67,42 @@ export interface Refresher {
   dispose(): void
 }
 
+/** 自动刷新的子进程 worker：与手动刷新同一份脚本，嵌入模型只在子进程加载。 */
+const SEMANTIC_REFRESH_WORKER = [
+  "const mod = await import(process.env.DSH_KNJ_REFRESH_MODULE || '')",
+  "const vaultRoot = process.env.DSH_KNJ_REFRESH_VAULT || process.cwd()",
+  "let out = { ok: false }",
+  "try {",
+  "  const rt = await mod.createSemanticRuntime({ vaultRoot })",
+  "  if (!rt.modelPresent) { out = { ok: false, note: 'model-missing' } }",
+  "  else if (!rt.store) { out = { ok: false, note: 'library-missing' } }",
+  "  else {",
+  "    await rt.store.update()",
+  "    const emb = await rt.store.embed()",
+  "    await rt.store.close?.()",
+  "    out = { ok: true, documents: emb?.docsProcessed ?? 0, chunks: emb?.chunksEmbedded ?? 0 }",
+  "  }",
+  "} catch (e) { out = { ok: false, note: e && e.message ? e.message : String(e) } }",
+  "process.stdout.write(JSON.stringify(out))",
+].join('\n')
+
+/** 在分离的子进程里跑一次索引刷新；宿主只关心「是否已启动」，绝不加载模型。 */
+export async function spawnRefreshChild(vaultRoot: string): Promise<boolean> {
+  try {
+    const { spawn } = await import('node:child_process')
+    const moduleUrl = new URL('./semantic-index.js', import.meta.url).href
+    const child = spawn(process.execPath, ['--input-type=module', '-e', SEMANTIC_REFRESH_WORKER], {
+      env: { ...process.env, DSH_KNJ_REFRESH_MODULE: moduleUrl, DSH_KNJ_REFRESH_VAULT: String(vaultRoot ?? '') },
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    child.unref()
+    return true
+  } catch {
+    return false
+  }
+}
 export const DEFAULT_DEBOUNCE_MS = 15_000
 export const DEFAULT_MAX_AUTO_DOCS = 500
 
@@ -171,7 +207,12 @@ export function createRefresher(opts: RefresherOptions): Refresher {
       }
       return
     }
-    await refreshNow()
+    // 2026-10-21：改由子进程执行，宿主内不再加载 300M 模型。
+    const started = await spawnRefreshChild(opts.vaultRoot)
+    lastRun = {
+      ok: started, at: new Date().toISOString(), documents: 0, chunks: 0, durationMs: 0,
+      note: started ? '自动刷新已交给子进程执行（宿主不加载模型）' : '自动刷新子进程启动失败，已跳过本次刷新',
+    }
   }
 
   function schedule(): void {

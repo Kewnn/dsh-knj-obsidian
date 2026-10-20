@@ -49,6 +49,8 @@ export interface Refresher {
     status(): Promise<SemanticStatusView>;
     dispose(): void;
 }
+/** 在分离的子进程里跑一次索引刷新；宿主只关心「是否已启动」，绝不加载模型。 */
+export declare function spawnRefreshChild(vaultRoot: string): Promise<boolean>;
 export declare const DEFAULT_DEBOUNCE_MS = 15000;
 export declare const DEFAULT_MAX_AUTO_DOCS = 500;
 /** 把 qmd 状态喂给纯函数分类器，返回 {indexState, documents, pendingEmbedding, hasVectorIndex}。 */
