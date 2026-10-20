@@ -196,6 +196,84 @@ export function disposeSemanticRuntimes(): void {
   semanticRuntimes.clear()
 }
 
+/** 语义检索子进程 worker：在独立 node 进程里加载 QMD + 嵌入模型，绝不进宿主。 */
+const SEMANTIC_SEARCH_WORKER = [
+        "const mod = await import(process.env.DSH_KNJ_SEMANTIC_MODULE || '')",
+        "const query = Buffer.from(process.env.DSH_KNJ_SEMANTIC_QUERY || '', 'base64').toString('utf8')",
+        "const limit = mod.clampLimit(Number(process.env.DSH_KNJ_SEMANTIC_LIMIT || '8'))",
+        "const vaultRoot = process.env.DSH_KNJ_SEMANTIC_VAULT || process.cwd()",
+        'let out',
+        'try {',
+        '  const runtime = await mod.createSemanticRuntime({ vaultRoot })',
+        '  if (!runtime.modelPresent) {',
+        "    out = { status: 'model-missing', count: 0, results: [], message: mod.notReadyMessage('model-missing', mod.resolveStateHome().modelsDir, mod.DEFAULT_MODEL_FILENAME) }",
+        '  } else if (!runtime.store) {',
+        "    out = { status: 'library-missing', count: 0, results: [], message: mod.notReadyMessage('library-missing') }",
+        '  } else if (runtime.status === "index-empty") {',
+        "    out = { status: 'index-empty', count: 0, results: [], message: '语义索引为空：请先在边栏点「更新索引」，首次全量嵌入约 1–2 分钟。' }",
+        '  } else {',
+        '    const outcome = await mod.runOfflineSearch(runtime.store, query, limit)',
+        "    const staleNote = runtime.status === 'index-stale' ? ('索引有 ' + runtime.index.pendingEmbedding + ' 篇未嵌入（结果可能不含最新页）：建议点「更新索引」。') : ''",
+        "    const note = [outcome.degraded, staleNote].filter(Boolean).join('；')",
+        '    out = { status: runtime.status, count: outcome.results.length, results: outcome.results }',
+        "    if (runtime.status === 'index-stale') out.stale = true",
+        '    if (note) out.message = note',
+        '    try { await runtime.store.close?.() } catch (error) { /* 关闭失败不影响检索结果 */ }',
+        '  }',
+        '} catch (error) {',
+        "  out = { status: 'index-empty', count: 0, results: [], message: '语义检索子进程失败：' + (error && error.message ? error.message : String(error)) }",
+        '}',
+        "process.stdout.write(JSON.stringify(out) + '\\n')",
+        'process.exit(0)',
+      ].join('\n')
+
+export interface SemanticChildOutcome {
+  ok: boolean
+  data?: Record<string, unknown>
+  error?: string
+}
+
+/** 在子进程里跑一次语义检索。ok=false 表示子进程不可用（超时/报错），调用方应降级，绝不回退进程内实现。 */
+export async function runSemanticSearchChildRaw(query: string, limit: number, vaultRoot: string): Promise<SemanticChildOutcome> {
+  try {
+    const { execFile } = await import('node:child_process')
+    const { promisify } = await import('node:util')
+    const moduleUrl = new URL('./semantic-index.js', import.meta.url).href
+    const payload = Buffer.from(String(query ?? ''), 'utf8').toString('base64')
+    const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', SEMANTIC_SEARCH_WORKER], {
+      timeout: 25000,
+      windowsHide: true,
+      maxBuffer: 8388608,
+      env: {
+        ...process.env,
+        DSH_KNJ_SEMANTIC_MODULE: moduleUrl,
+        DSH_KNJ_SEMANTIC_QUERY: payload,
+        DSH_KNJ_SEMANTIC_LIMIT: String(limit),
+        DSH_KNJ_SEMANTIC_VAULT: String(vaultRoot ?? ''),
+      },
+    })
+    const line = String(stdout ?? '').trim().split('\n').filter(Boolean).pop() ?? '{}'
+    return { ok: true, data: JSON.parse(line) as Record<string, unknown> }
+  } catch (error) {
+    const err = error as { killed?: boolean; stderr?: string; message?: string }
+    const why = err?.killed ? '25 秒超时' : (err?.stderr ? String(err.stderr).trim().slice(0, 300) : (err?.message ?? String(error)))
+    return { ok: false, error: why }
+  }
+}
+
+/** 子进程结果 → retriever 的 SemanticPageHit（只接受正式分类且字段完整的条目）。 */
+function semanticHitsFromChild(data: Record<string, unknown> | undefined): SemanticPageHit[] {
+  const list = Array.isArray(data?.results) ? (data!.results as Array<Record<string, unknown>>) : []
+  const out: SemanticPageHit[] = []
+  for (const item of list) {
+    if (!item || typeof item.id !== 'string' || typeof item.category !== 'string') continue
+    const hit: SemanticPageHit = { id: item.id, category: item.category as SemanticPageHit["category"] }
+    if (item.snippet) hit.snippet = String(item.snippet)
+    out.push(hit)
+  }
+  return out
+}
+
 export function mountTools(ctx: Context, provider: VaultProvider, opts: MountToolsOptions = {}): () => void {
   const runtimeFactory = opts.semanticRuntimeFactory ?? ((root: string) => createSemanticRuntime({ vaultRoot: root }))
 
@@ -235,15 +313,10 @@ export function mountTools(ctx: Context, provider: VaultProvider, opts: MountToo
     if (!semanticFallbackEnabled()) return []
     const store = currentReadonlyStore(provider)
     const vaultRoot = provider.currentRecord()?.root ?? vaultRootOf(store)
-    const runtime = await semanticRuntimeFor(vaultRoot, runtimeFactory)
-    if (!runtime?.store) return []
-    if (runtime.status === 'index-empty') return []
-    try {
-      const outcome = await runOfflineSearch(runtime.store, query, limit)
-      return toSemanticPageHits(outcome.results)
-    } catch {
-      return []
-    }
+    // 2026-10-21：改走子进程。此前在宿主进程内加载 300M 模型，实测把 DSH 宿主直接搞死（3 次）。
+    const child = await runSemanticSearchChildRaw(query, limit, String(vaultRoot ?? ''))
+    if (!child.ok) return []
+    return semanticHitsFromChild(child.data)
   }
 
   ctx.tools.register(defineTool({
@@ -1181,36 +1254,7 @@ export function mountTools(ctx: Context, provider: VaultProvider, opts: MountToo
       //   2.4 秒返回 3 条向量命中 → 引擎、模型、索引都没问题，问题只在「宿主进程内加载模型」这一步。
       // 处理：检索改由子进程执行（-e 内联脚本，无需额外文件、不改构建），25 秒超时；超时或失败只
       //   降级返回可读信息，绝不把宿主拖下水。下面的进程内实现保留作为回退参考，正常路径不会走到。
-      const SEMANTIC_SEARCH_WORKER = [
-        "const mod = await import(process.env.DSH_KNJ_SEMANTIC_MODULE || '')",
-        "const query = Buffer.from(process.env.DSH_KNJ_SEMANTIC_QUERY || '', 'base64').toString('utf8')",
-        "const limit = mod.clampLimit(Number(process.env.DSH_KNJ_SEMANTIC_LIMIT || '8'))",
-        "const vaultRoot = process.env.DSH_KNJ_SEMANTIC_VAULT || process.cwd()",
-        'let out',
-        'try {',
-        '  const runtime = await mod.createSemanticRuntime({ vaultRoot })',
-        '  if (!runtime.modelPresent) {',
-        "    out = { status: 'model-missing', count: 0, results: [], message: mod.notReadyMessage('model-missing', mod.resolveStateHome().modelsDir, mod.DEFAULT_MODEL_FILENAME) }",
-        '  } else if (!runtime.store) {',
-        "    out = { status: 'library-missing', count: 0, results: [], message: mod.notReadyMessage('library-missing') }",
-        '  } else if (runtime.status === "index-empty") {',
-        "    out = { status: 'index-empty', count: 0, results: [], message: '语义索引为空：请先在边栏点「更新索引」，首次全量嵌入约 1–2 分钟。' }",
-        '  } else {',
-        '    const outcome = await mod.runOfflineSearch(runtime.store, query, limit)',
-        "    const staleNote = runtime.status === 'index-stale' ? ('索引有 ' + runtime.index.pendingEmbedding + ' 篇未嵌入（结果可能不含最新页）：建议点「更新索引」。') : ''",
-        "    const note = [outcome.degraded, staleNote].filter(Boolean).join('；')",
-        '    out = { status: runtime.status, count: outcome.results.length, results: outcome.results }',
-        "    if (runtime.status === 'index-stale') out.stale = true",
-        '    if (note) out.message = note',
-        '    try { await runtime.store.close?.() } catch (error) { /* 关闭失败不影响检索结果 */ }',
-        '  }',
-        '} catch (error) {',
-        "  out = { status: 'index-empty', count: 0, results: [], message: '语义检索子进程失败：' + (error && error.message ? error.message : String(error)) }",
-        '}',
-        "process.stdout.write(JSON.stringify(out) + '\\n')",
-        'process.exit(0)',
-      ].join('\n')
-
+      
       /** 子进程检索的结果形状（与本工具的 output schema 对齐）。 */
       type SemanticSearchChildResult = {
         status: string
@@ -1223,32 +1267,13 @@ export function mountTools(ctx: Context, provider: VaultProvider, opts: MountToo
 
       /** 子进程检索。返回 null 仅表示拿不到模块地址，调用方才会回退到下面的进程内实现。 */
       const runSemanticSearchInChild = async (): Promise<SemanticSearchChildResult | null> => {
-        try {
-          const { execFile } = await import('node:child_process')
-          const { promisify } = await import('node:util')
-          const moduleUrl = new URL('./semantic-index.js', import.meta.url).href
-          const payload = Buffer.from(String(args.query ?? ''), 'utf8').toString('base64')
-          const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', SEMANTIC_SEARCH_WORKER], {
-            timeout: 25000,
-            windowsHide: true,
-            maxBuffer: 8388608,
-            env: {
-              ...process.env,
-              DSH_KNJ_SEMANTIC_MODULE: moduleUrl,
-              DSH_KNJ_SEMANTIC_QUERY: payload,
-              DSH_KNJ_SEMANTIC_LIMIT: String(limit),
-              DSH_KNJ_SEMANTIC_VAULT: String(vaultRoot ?? ''),
-            },
-          })
-          const line = String(stdout ?? '').trim().split('\n').filter(Boolean).pop() ?? '{}'
-          return { ...(JSON.parse(line) as Record<string, unknown>), limit } as unknown as SemanticSearchChildResult
-        } catch (error) {
-          const err = error as { killed?: boolean; stderr?: string; message?: string }
-          const why = err?.killed ? '25 秒超时' : (err?.stderr ? String(err.stderr).trim().slice(0, 300) : (err?.message ?? String(error)))
-          return {
-            status: 'index-empty', limit, count: 0, results: [],
-            message: `语义检索子进程不可用：${why}。可改用关键词检索 wiki_query（L1–L4 分层检索仍然可用）。`,
-          }
+        const child = await runSemanticSearchChildRaw(String(args.query ?? ''), limit, String(vaultRoot ?? ''))
+        if (child.ok) {
+          return { ...(child.data as Record<string, unknown>), limit } as unknown as SemanticSearchChildResult
+        }
+        return {
+          status: 'index-empty', limit, count: 0, results: [],
+          message: `语义检索子进程不可用：${child.error ?? '未知错误'}。可改用关键词检索 wiki_query（L1–L4 分层检索仍然可用）。`,
         }
       }
 

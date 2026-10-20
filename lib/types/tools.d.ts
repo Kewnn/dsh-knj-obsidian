@@ -33,4 +33,11 @@ export interface MountToolsOptions {
 export declare function semanticFallbackEnabled(): boolean;
 /** 关闭并清空所有缓存的语义运行时（插件 dispose 时调用，避免 sqlite 句柄与模型常驻）。 */
 export declare function disposeSemanticRuntimes(): void;
+export interface SemanticChildOutcome {
+    ok: boolean;
+    data?: Record<string, unknown>;
+    error?: string;
+}
+/** 在子进程里跑一次语义检索。ok=false 表示子进程不可用（超时/报错），调用方应降级，绝不回退进程内实现。 */
+export declare function runSemanticSearchChildRaw(query: string, limit: number, vaultRoot: string): Promise<SemanticChildOutcome>;
 export declare function mountTools(ctx: Context, provider: VaultProvider, opts?: MountToolsOptions): () => void;

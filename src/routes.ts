@@ -13,6 +13,24 @@ import { refresherFor, vaultRootOf, type Refresher } from './semantic-refresh.ts
 import type { VaultProvider } from './types.ts'
 import type { WikiCategory } from './types.ts'
 
+const SEMANTIC_REFRESH_WORKER = [
+  "const mod = await import(process.env.DSH_KNJ_REFRESH_MODULE || '')",
+  "const vaultRoot = process.env.DSH_KNJ_REFRESH_VAULT || process.cwd()",
+  "let out = { ok: false }",
+  "try {",
+  "  const rt = await mod.createSemanticRuntime({ vaultRoot })",
+  "  if (!rt.modelPresent) { out = { ok: false, note: 'model-missing' } }",
+  "  else if (!rt.store) { out = { ok: false, note: 'library-missing' } }",
+  "  else {",
+  "    await rt.store.update()",
+  "    const emb = await rt.store.embed()",
+  "    await rt.store.close?.()",
+  "    out = { ok: true, documents: emb?.docsProcessed ?? 0, chunks: emb?.chunksEmbedded ?? 0 }",
+  "  }",
+  "} catch (e) { out = { ok: false, note: e && e.message ? e.message : String(e) } }",
+  "process.stdout.write(JSON.stringify(out))",
+].join('\n')
+
 export interface WebServerService {
   register(route: {
     kind: 'exact' | 'prefix'
@@ -154,17 +172,21 @@ export function mountWikiRoutes(host: WikiHost, provider: VaultProvider, deps: W
       }
       if (path === `${BASE}/semantic-update`) {
         if (method !== 'POST') { sendJson(response, 405, { error: 'method not allowed' }); return }
-        const refresher = getRefresher(vaultRootOf(store))
-        const before = await refresher.status()
-        if (before.refreshing) {
-          // 单飞：已在刷新就直接回报，不排队（真实库冷启动约 1.5 分钟）
-          sendJson(response, 202, { started: false, running: true, status: before })
+        // 2026-10-21：刷新改由子进程执行。此前 refreshNow() 在宿主进程内加载 300M 模型，会把宿主搞死。
+        if ((process.env.KNJ_OBSIDIAN_SEMANTIC_REFRESH ?? '').trim().toLowerCase() === 'off') {
+          sendJson(response, 409, { started: false, disabled: true, error: '语义索引刷新已禁用（KNJ_OBSIDIAN_SEMANTIC_REFRESH=off）' })
           return
         }
-        // 后台跑：立刻返回，进度由 semantic-status 轮询
-        void refresher.refreshNow()
-        const after = await refresher.status()
-        sendJson(response, 202, { started: true, running: after.refreshing, status: after })
+        const { spawn } = await import('node:child_process')
+        const moduleUrl = new URL('./semantic-index.js', import.meta.url).href
+        const child = spawn(process.execPath, ['--input-type=module', '-e', SEMANTIC_REFRESH_WORKER], {
+          env: { ...process.env, DSH_KNJ_REFRESH_MODULE: moduleUrl, DSH_KNJ_REFRESH_VAULT: String(vaultRootOf(store)) },
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        })
+        child.unref()
+        sendJson(response, 202, { started: true, mode: 'child-process' })
         return
       }
       if (method === 'GET' && path === `${BASE}/pages`) {
